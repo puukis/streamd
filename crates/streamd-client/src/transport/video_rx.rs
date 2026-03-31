@@ -11,7 +11,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::Duration;
 use streamd_proto::packets::MAX_FRAME_AGE_US;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use streamd_proto::packets::parse_video_header as parse_header;
 
@@ -33,7 +33,7 @@ pub struct VideoReceiver {
 impl VideoReceiver {
     pub fn start(
         local_port: u16,
-        _server_ip: IpAddr,
+        server_ip: IpAddr,
     ) -> Result<(Self, crossbeam_channel::Receiver<DecodedFrame>)> {
         let bind_addr: SocketAddr = format!("0.0.0.0:{local_port}").parse()?;
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
@@ -61,6 +61,8 @@ impl VideoReceiver {
         socket.bind(&bind_addr.into())?;
         let udp: std::net::UdpSocket = socket.into();
         udp.set_read_timeout(Some(Duration::from_millis(100)))?;
+
+        info!("video receiver listening on {bind_addr} for server {server_ip}");
 
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(8);
         let stop = Arc::new(AtomicBool::new(false));
@@ -144,11 +146,14 @@ fn receive_loop(
     let mut buf = vec![0u8; 64 * 1024];
     // Circular buffer of reassembly state, indexed by frame_seq % 128
     let mut frames: HashMap<u32, FrameState> = HashMap::new();
+    let mut first_packet_logged = false;
+    let mut first_fragment_logged = false;
+    let mut first_parse_failure_logged = false;
     let mut first_frame_logged = false;
 
     while !stop.load(Ordering::Relaxed) {
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
+        let (n, peer) = match socket.recv_from(&mut buf) {
+            Ok(result) => result,
             Err(e)
                 if matches!(
                     e.kind(),
@@ -163,9 +168,30 @@ fn receive_loop(
             }
         };
 
+        if !first_packet_logged {
+            info!("video receiver received first UDP datagram from {peer} ({n} bytes)");
+            first_packet_logged = true;
+        }
+
         let Some((hdr, payload)) = parse_header(&buf[..n]) else {
+            if !first_parse_failure_logged {
+                warn!("video receiver dropped unparsable UDP datagram from {peer} ({n} bytes)");
+                first_parse_failure_logged = true;
+            }
             continue;
         };
+
+        if !first_fragment_logged {
+            info!(
+                "video receiver accepted first fragment seq={} slice={} frag={}/{} keyframe={}",
+                hdr.frame_seq,
+                hdr.slice_idx,
+                hdr.frag_idx + 1,
+                hdr.frag_total,
+                hdr.is_keyframe()
+            );
+            first_fragment_logged = true;
+        }
 
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

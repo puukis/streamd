@@ -113,15 +113,4 @@ impl VideoSender {
         self.remote_addr = addr;
         Ok(())
     }
-
-    /// Probe whether the remote supports jumbo frames (8900-byte datagrams).
-    /// Sends a probe and returns true if it appears to succeed.
-    pub fn probe_jumbo(&self) -> bool {
-        let probe = vec![0u8; MTU_LAN];
-        self.socket.send(&probe).is_ok()
-    }
-
-    pub fn set_jumbo(&mut self, jumbo: bool) {
-        self.mtu = if jumbo { MTU_LAN } else { MTU_WAN };
-    }
 }

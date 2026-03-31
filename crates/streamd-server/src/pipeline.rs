@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use streamd_proto::packets::{Codec, ServerTelemetry};
+use streamd_proto::packets::{Codec, ServerTelemetry, MTU_WAN};
 use tracing::{info, warn};
 
 #[cfg(target_os = "linux")]
@@ -219,14 +219,10 @@ fn run_pipeline_thread(
     let frame_interval = Duration::from_nanos(1_000_000_000 / fps as u64);
 
     // Set up UDP sender
-    let mut sender = VideoSender::new(video_port, remote, false).context("create UDP sender")?;
+    let sender = VideoSender::new(video_port, remote, false).context("create UDP sender")?;
 
-    // Probe for jumbo frames (LAN optimisation)
-    let jumbo = sender.probe_jumbo();
-    if jumbo {
-        sender.set_jumbo(true);
-        info!("LAN jumbo frames available (MTU ~8900 bytes)");
-    }
+    // Stay on the conservative payload size unless jumbo support is explicitly negotiated.
+    info!("video sender using conservative UDP MTU (~{MTU_WAN} bytes)");
 
     let mut stats = Stats::new();
     let mut frame_seq: u32 = 0;

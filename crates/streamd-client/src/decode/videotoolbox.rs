@@ -43,6 +43,8 @@ pub struct VideoToolboxDecoder {
 
 #[cfg(target_os = "macos")]
 use anyhow::Context;
+#[cfg(target_os = "macos")]
+static FIRST_DECODED_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
 
 impl VideoToolboxDecoder {
     pub fn start(frame_rx: Receiver<DecodedFrame>) -> Result<(Self, Receiver<RenderFrame>)> {
@@ -332,6 +334,8 @@ fn retain_pixel_buffer(
     frame_seq: u32,
     timestamp_us: u64,
 ) -> Result<RenderFrame> {
+    use tracing::info;
+
     let pixel_buffer = unsafe { CVPixelBuffer::wrap_under_get_rule(image) };
     let width = pixel_buffer.get_width() as u32;
     let height = pixel_buffer.get_height() as u32;
@@ -351,6 +355,13 @@ fn retain_pixel_buffer(
             || pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         "decoder returned unsupported pixel format {pixel_format:#x}"
     );
+
+    if !FIRST_DECODED_FRAME_LOGGED.swap(true, Ordering::Relaxed) {
+        info!(
+            "VideoToolbox produced first frame seq={} {}x{} format={pixel_format:#x}",
+            frame_seq, width, height
+        );
+    }
 
     Ok(RenderFrame {
         pixel_buffer,

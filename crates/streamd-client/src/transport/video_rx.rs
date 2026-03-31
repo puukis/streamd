@@ -144,6 +144,7 @@ fn receive_loop(
     let mut buf = vec![0u8; 64 * 1024];
     // Circular buffer of reassembly state, indexed by frame_seq % 128
     let mut frames: HashMap<u32, FrameState> = HashMap::new();
+    let mut first_frame_logged = false;
 
     while !stop.load(Ordering::Relaxed) {
         let n = match socket.recv(&mut buf) {
@@ -219,7 +220,15 @@ fn receive_loop(
                 timestamp_us: state.timestamp_us,
                 is_keyframe: state.is_keyframe,
             }) {
-                Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    if !first_frame_logged {
+                        info!(
+                            "video receiver assembled first frame seq={} keyframe={}",
+                            hdr.frame_seq, state.is_keyframe
+                        );
+                        first_frame_logged = true;
+                    }
+                }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
             }
 

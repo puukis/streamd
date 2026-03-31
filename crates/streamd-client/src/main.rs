@@ -6,8 +6,10 @@ mod transport;
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[cfg(target_os = "macos")]
+use std::net::SocketAddr;
+
+fn main() -> Result<()> {
     install_rustls_crypto_provider()?;
 
     tracing_subscriber::fmt()
@@ -21,7 +23,14 @@ async fn main() -> Result<()> {
     };
 
     info!("streamd-client connecting to {server_addr}");
-    transport::control::run_client(server_addr, options).await
+
+    #[cfg(target_os = "macos")]
+    if !options.list_displays {
+        return run_macos_client(server_addr, options);
+    }
+
+    let runtime = build_runtime()?;
+    runtime.block_on(transport::control::run_client(server_addr, options))
 }
 
 fn parse_args() -> Result<Option<(std::net::SocketAddr, transport::control::ClientOptions)>> {
@@ -77,4 +86,37 @@ fn install_rustls_crypto_provider() -> Result<()> {
         })
         .context("install rustls CryptoProvider")?;
     Ok(())
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build Tokio runtime")
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_client(
+    server_addr: SocketAddr,
+    options: transport::control::ClientOptions,
+) -> Result<()> {
+    let runtime = build_runtime()?;
+    let Some(mut session) = runtime.block_on(transport::control::connect_client_session(
+        server_addr,
+        options,
+    ))?
+    else {
+        return Ok(());
+    };
+
+    let render_rx = session.take_render_rx()?;
+    let render_result = render::metal::VideoRenderer::run(
+        render_rx,
+        session.width,
+        session.height,
+        session.shutdown_signal(),
+    );
+    let shutdown_result = runtime.block_on(session.shutdown());
+
+    render_result.and(shutdown_result)
 }

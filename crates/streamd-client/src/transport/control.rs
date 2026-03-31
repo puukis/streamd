@@ -17,13 +17,94 @@ use streamd_proto::{
 };
 use tracing::{info, warn};
 
+use crate::decode::videotoolbox::{RenderFrame, VideoToolboxDecoder};
+use crate::input::capture::InputCapture;
+use crate::transport::video_rx::VideoReceiver;
+
 #[derive(Debug, Clone, Default)]
 pub struct ClientOptions {
     pub display_selector: Option<String>,
     pub list_displays: bool,
 }
 
+pub struct ClientSession {
+    render_rx: Option<Receiver<RenderFrame>>,
+    pub width: u32,
+    pub height: u32,
+    shutdown: Arc<AtomicBool>,
+    send: Option<quinn::SendStream>,
+    input_capture: Option<InputCapture>,
+    input_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    control_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    video_receiver: Option<VideoReceiver>,
+    decoder: Option<VideoToolboxDecoder>,
+}
+
+impl ClientSession {
+    pub fn take_render_rx(&mut self) -> Result<Receiver<RenderFrame>> {
+        self.render_rx
+            .take()
+            .context("render receiver was already taken")
+    }
+
+    pub fn shutdown_signal(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
+    }
+
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        if let Some(input_capture) = self.input_capture.take() {
+            input_capture.release();
+        }
+
+        if let Some(mut send) = self.send.take() {
+            let _ = send_msg(&mut send, ControlMsg::Goodbye).await;
+            let _ = send.finish();
+        }
+
+        drop(self.decoder.take());
+        drop(self.video_receiver.take());
+
+        if let Some(input_task) = self.input_task.take() {
+            match input_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!("input task error: {err:#}"),
+                Err(err) => warn!("input task join error: {err}"),
+            }
+        }
+
+        if let Some(control_task) = self.control_task.take() {
+            match control_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!("control task error: {err:#}"),
+                Err(err) => warn!("control task join error: {err}"),
+            }
+        }
+
+        Ok(())
+    }
+}
+
 pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Result<()> {
+    let Some(mut session) = connect_client_session(server_addr, options).await? else {
+        return Ok(());
+    };
+    let render_rx = session.take_render_rx()?;
+    let render_result = crate::render::metal::VideoRenderer::run(
+        render_rx,
+        session.width,
+        session.height,
+        session.shutdown_signal(),
+    );
+    let shutdown_result = session.shutdown().await;
+    render_result.and(shutdown_result)
+}
+
+pub async fn connect_client_session(
+    server_addr: SocketAddr,
+    options: ClientOptions,
+) -> Result<Option<ClientSession>> {
     let endpoint = make_client_endpoint()?;
 
     // Try LAN direct first, fall back to provided address (Tailscale / WireGuard IP)
@@ -50,7 +131,7 @@ pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Resu
         print_displays(&displays);
         let _ = send_msg(&mut send, ControlMsg::Goodbye).await;
         let _ = send.finish();
-        return Ok(());
+        return Ok(None);
     }
 
     let selected_display = select_display(&displays, options.display_selector.as_deref())?;
@@ -99,7 +180,7 @@ pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Resu
 
     let input_stream = conn.open_uni().await.context("open input stream")?;
     let (input_tx, input_rx) = crossbeam_channel::bounded(1024);
-    let input_capture = crate::input::capture::InputCapture::start(input_tx)?;
+    let input_capture = InputCapture::start(input_tx)?;
     let input_runtime = tokio::runtime::Handle::current();
     let input_shutdown = shutdown.clone();
     let input_task = tokio::task::spawn_blocking(move || {
@@ -107,9 +188,8 @@ pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Resu
     });
 
     let video_port = session.client_video_udp_port;
-    let (video_receiver, frame_rx) =
-        crate::transport::video_rx::VideoReceiver::start(video_port, server_addr.ip())?;
-    let (decoder, render_rx) = crate::decode::videotoolbox::VideoToolboxDecoder::start(frame_rx)?;
+    let (video_receiver, frame_rx) = VideoReceiver::start(video_port, server_addr.ip())?;
+    let (decoder, render_rx) = VideoToolboxDecoder::start(frame_rx)?;
     let control_shutdown = shutdown.clone();
 
     let control_task = tokio::spawn(async move {
@@ -121,35 +201,18 @@ pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Resu
         result
     });
 
-    let render_result = crate::render::metal::VideoRenderer::run(
-        render_rx,
-        session.width,
-        session.height,
-        shutdown.clone(),
-    );
-
-    shutdown.store(true, Ordering::Relaxed);
-    input_capture.release();
-    drop(input_capture);
-    let _ = send_msg(&mut send, ControlMsg::Goodbye).await;
-    let _ = send.finish();
-
-    drop(decoder);
-    drop(video_receiver);
-
-    match input_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!("input task error: {err:#}"),
-        Err(err) => warn!("input task join error: {err}"),
-    }
-
-    match control_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!("control task error: {err:#}"),
-        Err(err) => warn!("control task join error: {err}"),
-    }
-
-    render_result
+    Ok(Some(ClientSession {
+        render_rx: Some(render_rx),
+        width: session.width,
+        height: session.height,
+        shutdown,
+        send: Some(send),
+        input_capture: Some(input_capture),
+        input_task: Some(input_task),
+        control_task: Some(control_task),
+        video_receiver: Some(video_receiver),
+        decoder: Some(decoder),
+    }))
 }
 
 fn select_display(displays: &[DisplayInfo], selector: Option<&str>) -> Result<DisplayInfo> {

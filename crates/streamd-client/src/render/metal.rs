@@ -30,7 +30,7 @@ use objc::{msg_send, sel, sel_impl};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::Ordering;
 #[cfg(target_os = "macos")]
-use tracing::warn;
+use tracing::{info, warn};
 
 pub struct VideoRenderer;
 
@@ -187,6 +187,7 @@ fn render_loop_macos(
         app.activateIgnoringOtherApps_(YES);
 
         let mut current_size = (initial_width, initial_height);
+        let mut first_frame_logged = false;
 
         loop {
             pump_app_events(app);
@@ -210,6 +211,13 @@ fn render_loop_macos(
             }
 
             if let Some(frame) = latest_frame {
+                if !first_frame_logged {
+                    info!(
+                        "Metal renderer received first frame seq={} {}x{}",
+                        frame.frame_seq, frame.width, frame.height
+                    );
+                    first_frame_logged = true;
+                }
                 if current_size != (frame.width, frame.height) {
                     current_size = (frame.width, frame.height);
                     resize_window_and_layer(

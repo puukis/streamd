@@ -373,12 +373,22 @@ unsafe fn resize_window_and_layer(
 fn present_frame(state: &mut RendererState, frame: &RenderFrame) -> Result<()> {
     let pixel_buffer = &frame.pixel_buffer;
     let pixel_format = pixel_buffer.get_pixel_format();
+    info!(
+        "present_frame: pixel_format={:#x} planes={} y={}x{} uv={}x{}",
+        pixel_format,
+        pixel_buffer.get_plane_count(),
+        pixel_buffer.get_width_of_plane(0),
+        pixel_buffer.get_height_of_plane(0),
+        pixel_buffer.get_width_of_plane(1),
+        pixel_buffer.get_height_of_plane(1),
+    );
     let full_range = match pixel_format {
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => false,
         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => true,
         other => bail!("unsupported pixel format for Metal presenter: {other:#x}"),
     };
 
+    info!("present_frame: creating luma CVMetalTexture");
     let y_cv_texture = create_cv_metal_texture(
         &state.texture_cache,
         pixel_buffer,
@@ -387,6 +397,7 @@ fn present_frame(state: &mut RendererState, frame: &RenderFrame) -> Result<()> {
         pixel_buffer.get_height_of_plane(0),
         0,
     )?;
+    info!("present_frame: creating chroma CVMetalTexture");
     let uv_cv_texture = create_cv_metal_texture(
         &state.texture_cache,
         pixel_buffer,
@@ -395,6 +406,7 @@ fn present_frame(state: &mut RendererState, frame: &RenderFrame) -> Result<()> {
         pixel_buffer.get_height_of_plane(1),
         1,
     )?;
+    info!("present_frame: unwrapping Metal textures");
     let y_texture = y_cv_texture
         .get_texture()
         .context("CVMetalTexture did not expose a luma MTLTexture")?;
@@ -402,10 +414,13 @@ fn present_frame(state: &mut RendererState, frame: &RenderFrame) -> Result<()> {
         .get_texture()
         .context("CVMetalTexture did not expose a chroma MTLTexture")?;
 
+    info!("present_frame: acquiring drawable");
     let Some(drawable) = state.layer.next_drawable() else {
+        info!("present_frame: no drawable available, skipping");
         return Ok(());
     };
 
+    info!("present_frame: building render pass descriptor");
     let pass_descriptor = RenderPassDescriptor::new();
     let color_attachment = pass_descriptor
         .color_attachments()
@@ -416,8 +431,10 @@ fn present_frame(state: &mut RendererState, frame: &RenderFrame) -> Result<()> {
     color_attachment.set_store_action(MTLStoreAction::Store);
     color_attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
 
+    info!("present_frame: creating command buffer and encoder");
     let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_render_command_encoder(pass_descriptor);
+    info!("present_frame: encoding draw call (flipped={})", y_cv_texture.is_flipped());
     let vertices = fullscreen_vertices(y_cv_texture.is_flipped());
     let conversion = ColorConversionParams {
         full_range: full_range as u32,
@@ -437,11 +454,14 @@ fn present_frame(state: &mut RendererState, frame: &RenderFrame) -> Result<()> {
         (&conversion as *const ColorConversionParams).cast(),
     );
     encoder.draw_primitives(MTLPrimitiveType::TriangleStrip, 0, 4);
+    info!("present_frame: ending encoding");
     encoder.end_encoding();
 
+    info!("present_frame: committing");
     command_buffer.present_drawable(drawable);
     command_buffer.commit();
 
+    info!("present_frame: done");
     Ok(())
 }
 

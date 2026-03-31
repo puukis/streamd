@@ -149,15 +149,23 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
     );
     send_msg(&mut send, ControlMsg::SessionAccept(accept)).await?;
 
-    let input_stream = conn.accept_uni().await.context("accept input stream")?;
     let (input_tx, input_rx) = crossbeam_channel::bounded(1024);
     #[cfg(target_os = "linux")]
     let _input_injector = crate::input::linux::LinuxInputInjector::start(input_rx)?;
     #[cfg(target_os = "windows")]
     let _input_injector = crate::input::windows::WindowsInputInjector::start(input_rx)?;
+    let input_conn = conn.clone();
     let input_task = tokio::spawn(async move {
-        if let Err(err) = input_loop(input_stream, input_tx).await {
-            warn!("input stream ended: {err:#}");
+        match input_conn.accept_uni().await {
+            Ok(input_stream) => {
+                debug!("client {remote} opened input stream");
+                if let Err(err) = input_loop(input_stream, input_tx).await {
+                    warn!("input stream ended: {err:#}");
+                }
+            }
+            Err(err) => {
+                warn!("accept input stream failed: {err:#}");
+            }
         }
     });
 

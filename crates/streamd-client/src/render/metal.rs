@@ -99,11 +99,11 @@ vertex VertexOut video_vertex(
     const device VertexIn* vertices [[buffer(0)]],
     uint vertex_id [[vertex_id]]
 ) {
-    VertexOut out;
-    const VertexIn vertex = vertices[vertex_id];
-    out.position = float4(vertex.position, 0.0, 1.0);
-    out.tex_coord = vertex.tex_coord;
-    return out;
+    VertexOut vertex_out;
+    const VertexIn vertex_in = vertices[vertex_id];
+    vertex_out.position = float4(vertex_in.position, 0.0, 1.0);
+    vertex_out.tex_coord = vertex_in.tex_coord;
+    return vertex_out;
 }
 
 fragment float4 video_fragment(

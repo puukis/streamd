@@ -1,0 +1,344 @@
+//! QUIC control channel — session handshake, IDR requests, heartbeats.
+
+use anyhow::{bail, Context, Result};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use quinn::{ClientConfig, Endpoint};
+use rustls::pki_types::ServerName;
+use std::net::SocketAddr;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
+use streamd_proto::{
+    control::{decode_msg, encode_msg},
+    input::encode_packet,
+    packets::{Codec, ControlMsg, DisplayInfo, InputPacket, SessionRequest, PROTOCOL_VERSION},
+};
+use tracing::{info, warn};
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientOptions {
+    pub display_selector: Option<String>,
+    pub list_displays: bool,
+}
+
+pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Result<()> {
+    let endpoint = make_client_endpoint()?;
+
+    // Try LAN direct first, fall back to provided address (Tailscale / WireGuard IP)
+    let conn = endpoint
+        .connect(server_addr, "streamd")
+        .context("QUIC connect")?
+        .await
+        .context("QUIC handshake")?;
+
+    info!("connected to {}", conn.remote_address());
+
+    let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
+
+    send_msg(&mut send, ControlMsg::QueryDisplays).await?;
+    let displays = match read_control_msg(&mut recv).await? {
+        ControlMsg::AvailableDisplays(displays) => displays,
+        ControlMsg::SessionReject(reject) => {
+            bail!("server rejected display query: {}", reject.reason)
+        }
+        other => bail!("unexpected display-list response: {other:?}"),
+    };
+
+    if options.list_displays {
+        print_displays(&displays);
+        let _ = send_msg(&mut send, ControlMsg::Goodbye).await;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    let selected_display = select_display(&displays, options.display_selector.as_deref())?;
+    let width = if selected_display.width > 0 {
+        selected_display.width
+    } else {
+        1920
+    };
+    let height = if selected_display.height > 0 {
+        selected_display.height
+    } else {
+        1080
+    };
+
+    // Send SessionRequest
+    let req = SessionRequest {
+        version: PROTOCOL_VERSION,
+        max_fps: 60,
+        width,
+        height,
+        preferred_codecs: vec![Codec::H264, Codec::Hevc],
+        display_id: Some(selected_display.id.clone()),
+    };
+    send_msg(&mut send, ControlMsg::SessionRequest(req)).await?;
+
+    // Wait for accept/reject
+    let response = read_control_msg(&mut recv).await?;
+    let session = match response {
+        ControlMsg::SessionAccept(s) => s,
+        ControlMsg::SessionReject(r) => bail!("server rejected session: {}", r.reason),
+        other => bail!("unexpected response: {other:?}"),
+    };
+
+    info!(
+        "session accepted: {:?} {}x{}@{}fps, display={} ({}), video udp:{}",
+        session.codec,
+        session.width,
+        session.height,
+        session.fps,
+        session.selected_display.name,
+        session.selected_display.id,
+        session.video_udp_port
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let input_stream = conn.open_uni().await.context("open input stream")?;
+    let (input_tx, input_rx) = crossbeam_channel::bounded(1024);
+    let input_capture = crate::input::capture::InputCapture::start(input_tx)?;
+    let input_runtime = tokio::runtime::Handle::current();
+    let input_shutdown = shutdown.clone();
+    let input_task = tokio::task::spawn_blocking(move || {
+        forward_input_loop(input_rx, input_stream, input_runtime, input_shutdown)
+    });
+
+    let video_port = session.client_video_udp_port;
+    let (video_receiver, frame_rx) =
+        crate::transport::video_rx::VideoReceiver::start(video_port, server_addr.ip())?;
+    let (decoder, render_rx) = crate::decode::videotoolbox::VideoToolboxDecoder::start(frame_rx)?;
+    let control_shutdown = shutdown.clone();
+
+    let control_task = tokio::spawn(async move {
+        let result = control_loop(recv).await;
+        control_shutdown.store(true, Ordering::Relaxed);
+        if let Err(err) = &result {
+            warn!("control loop ended: {err:#}");
+        }
+        result
+    });
+
+    let render_result = crate::render::metal::VideoRenderer::run(
+        render_rx,
+        session.width,
+        session.height,
+        shutdown.clone(),
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    input_capture.release();
+    drop(input_capture);
+    let _ = send_msg(&mut send, ControlMsg::Goodbye).await;
+    let _ = send.finish();
+
+    drop(decoder);
+    drop(video_receiver);
+
+    match input_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("input task error: {err:#}"),
+        Err(err) => warn!("input task join error: {err}"),
+    }
+
+    match control_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("control task error: {err:#}"),
+        Err(err) => warn!("control task join error: {err}"),
+    }
+
+    render_result
+}
+
+fn select_display(displays: &[DisplayInfo], selector: Option<&str>) -> Result<DisplayInfo> {
+    if displays.is_empty() {
+        bail!("the server did not report any capture displays");
+    }
+
+    let Some(selector) = selector
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+    else {
+        return Ok(displays[0].clone());
+    };
+
+    if let Ok(index) = selector.parse::<u32>() {
+        if let Some(display) = displays.iter().find(|display| display.index == index) {
+            return Ok(display.clone());
+        }
+    }
+
+    if let Some(display) = displays.iter().find(|display| display.id == selector) {
+        return Ok(display.clone());
+    }
+
+    if let Some(display) = displays
+        .iter()
+        .find(|display| display.name.eq_ignore_ascii_case(selector))
+    {
+        return Ok(display.clone());
+    }
+
+    if let Some(display) = displays.iter().find(|display| {
+        display
+            .description
+            .as_deref()
+            .is_some_and(|description| description.eq_ignore_ascii_case(selector))
+    }) {
+        return Ok(display.clone());
+    }
+
+    bail!(
+        "no display matched selector {selector:?}; available selectors are ids, numeric indexes, names, or descriptions"
+    )
+}
+
+fn print_displays(displays: &[DisplayInfo]) {
+    if displays.is_empty() {
+        println!("No displays available.");
+        return;
+    }
+
+    for display in displays {
+        let description = display
+            .description
+            .as_deref()
+            .map(|description| format!(" ({description})"))
+            .unwrap_or_default();
+        println!(
+            "[{}] {} {} {}x{}{}",
+            display.index, display.id, display.name, display.width, display.height, description
+        );
+    }
+}
+
+async fn control_loop(mut recv: quinn::RecvStream) -> Result<()> {
+    loop {
+        match read_control_msg(&mut recv).await {
+            Ok(ControlMsg::Heartbeat(t)) => {
+                info!(
+                    "server telemetry: encode={}µs idr_count={}",
+                    t.avg_encode_us, t.idr_count
+                );
+            }
+            Ok(ControlMsg::Goodbye) => {
+                info!("server disconnected");
+                break;
+            }
+            Ok(other) => warn!("unexpected: {other:?}"),
+            Err(err) => {
+                info!("server disconnected: {err:#}");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_control_msg(recv: &mut quinn::RecvStream) -> Result<ControlMsg> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await.context("read length")?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > 1 << 20 {
+        bail!("control message too large: {len}");
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await.context("read payload")?;
+    let mut framed = Vec::with_capacity(4 + len);
+    framed.extend_from_slice(&len_buf);
+    framed.extend_from_slice(&buf);
+    let (msg, _) = decode_msg(&framed).context("decode")?;
+    Ok(msg)
+}
+
+async fn send_msg(send: &mut quinn::SendStream, msg: ControlMsg) -> Result<()> {
+    let bytes = encode_msg(&msg);
+    send.write_all(&bytes).await.context("write")?;
+    Ok(())
+}
+
+fn forward_input_loop(
+    input_rx: Receiver<InputPacket>,
+    mut input_stream: quinn::SendStream,
+    runtime: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    loop {
+        match input_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(packet) => {
+                let bytes = encode_packet(&packet);
+                runtime
+                    .block_on(input_stream.write_all(&bytes))
+                    .context("write input packet")?;
+            }
+            Err(RecvTimeoutError::Timeout) if shutdown.load(Ordering::Relaxed) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    input_stream.finish().context("finish input stream")?;
+    Ok(())
+}
+
+fn make_client_endpoint() -> Result<Endpoint> {
+    // Accept any self-signed cert from the server (personal use — no CA).
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+        .with_no_client_auth();
+
+    let client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .context("build QUIC client config")?,
+    ));
+
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?).context("create client endpoint")?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+/// Certificate verifier that accepts any server certificate.
+/// Appropriate for a personal LAN/VPN tool where you control both ends.
+#[derive(Debug)]
+struct AcceptAnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dh_params: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dhs: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}

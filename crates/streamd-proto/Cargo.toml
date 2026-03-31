@@ -1,0 +1,10 @@
+[package]
+name = "streamd-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+bitflags = { version = "2.9", features = ["serde"] }

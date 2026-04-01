@@ -21,6 +21,14 @@ use core_graphics::{
     geometry::{CGPoint, CGRect},
 };
 
+#[cfg(target_os = "macos")]
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+#[cfg(target_os = "macos")]
+use core_graphics::event::{
+    CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, EventField,
+};
+
 /// A handle to the running input capture worker.
 pub struct InputCapture {
     captured: Arc<AtomicBool>,
@@ -101,6 +109,15 @@ impl CaptureState {
         info!("input capture thread started");
 
         let (raw_tx, raw_rx) = crossbeam_channel::bounded::<rdev::Event>(512);
+
+        // On macOS, rdev::listen calls TISCopyCurrentKeyboardInputSource() from a
+        // background thread on every KeyDown event. On macOS 14+ this function is
+        // main-thread-only and raises EXC_BREAKPOINT (SIGTRAP) on any other thread.
+        // Use a direct CGEventTap instead, bypassing all TIS calls.
+        #[cfg(target_os = "macos")]
+        spawn_cg_event_tap(raw_tx);
+
+        #[cfg(not(target_os = "macos"))]
         let _listen_thread = std::thread::Builder::new()
             .name("streamd-rdev-listen".into())
             .spawn(move || {
@@ -572,6 +589,267 @@ fn rdev_key_to_macos_vk(key: rdev::Key) -> Option<u16> {
     };
 
     Some(vk)
+}
+
+/// Spawn a dedicated thread that installs a listen-only CGEventTap and feeds
+/// converted `rdev::Event` values into `raw_tx`. Unlike `rdev::listen`, this
+/// never calls `TISCopyCurrentKeyboardInputSource`, which is main-thread-only
+/// on macOS 14+ and causes EXC_BREAKPOINT when called from a background thread.
+#[cfg(target_os = "macos")]
+fn spawn_cg_event_tap(raw_tx: crossbeam_channel::Sender<rdev::Event>) {
+    std::thread::Builder::new()
+        .name("streamd-cg-event-tap".into())
+        .spawn(move || {
+            let tap = CGEventTap::new(
+                CGEventTapLocation::Session,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::ListenOnly,
+                vec![
+                    CGEventType::KeyDown,
+                    CGEventType::KeyUp,
+                    CGEventType::FlagsChanged,
+                    CGEventType::LeftMouseDown,
+                    CGEventType::LeftMouseUp,
+                    CGEventType::RightMouseDown,
+                    CGEventType::RightMouseUp,
+                    CGEventType::OtherMouseDown,
+                    CGEventType::OtherMouseUp,
+                    CGEventType::MouseMoved,
+                    CGEventType::LeftMouseDragged,
+                    CGEventType::RightMouseDragged,
+                    CGEventType::OtherMouseDragged,
+                    CGEventType::ScrollWheel,
+                ],
+                move |_proxy, ev_type, event| {
+                    let rdev_event_type = match ev_type {
+                        CGEventType::KeyDown | CGEventType::KeyUp => {
+                            let keycode = event
+                                .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                as u16;
+                            let key = cg_keycode_to_rdev_key(keycode)
+                                .unwrap_or(rdev::Key::Unknown(keycode as u32));
+                            if matches!(ev_type, CGEventType::KeyDown) {
+                                rdev::EventType::KeyPress(key)
+                            } else {
+                                rdev::EventType::KeyRelease(key)
+                            }
+                        }
+                        CGEventType::FlagsChanged => {
+                            let keycode = event
+                                .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                as u16;
+                            let key = cg_keycode_to_rdev_key(keycode)
+                                .unwrap_or(rdev::Key::Unknown(keycode as u32));
+                            let flags = event.get_flags();
+                            if modifier_key_pressed(keycode, flags) {
+                                rdev::EventType::KeyPress(key)
+                            } else {
+                                rdev::EventType::KeyRelease(key)
+                            }
+                        }
+                        CGEventType::LeftMouseDown => {
+                            rdev::EventType::ButtonPress(rdev::Button::Left)
+                        }
+                        CGEventType::LeftMouseUp => {
+                            rdev::EventType::ButtonRelease(rdev::Button::Left)
+                        }
+                        CGEventType::RightMouseDown => {
+                            rdev::EventType::ButtonPress(rdev::Button::Right)
+                        }
+                        CGEventType::RightMouseUp => {
+                            rdev::EventType::ButtonRelease(rdev::Button::Right)
+                        }
+                        CGEventType::OtherMouseDown => {
+                            let n = event.get_integer_value_field(
+                                EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                            ) as u8;
+                            rdev::EventType::ButtonPress(rdev::Button::Unknown(n))
+                        }
+                        CGEventType::OtherMouseUp => {
+                            let n = event.get_integer_value_field(
+                                EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                            ) as u8;
+                            rdev::EventType::ButtonRelease(rdev::Button::Unknown(n))
+                        }
+                        CGEventType::MouseMoved
+                        | CGEventType::LeftMouseDragged
+                        | CGEventType::RightMouseDragged
+                        | CGEventType::OtherMouseDragged => {
+                            let loc = event.location();
+                            rdev::EventType::MouseMove { x: loc.x, y: loc.y }
+                        }
+                        CGEventType::ScrollWheel => {
+                            let dx = event.get_integer_value_field(
+                                EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+                            );
+                            let dy = event.get_integer_value_field(
+                                EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+                            );
+                            rdev::EventType::Wheel {
+                                delta_x: dx,
+                                delta_y: dy,
+                            }
+                        }
+                        _ => return None,
+                    };
+
+                    let _ = raw_tx.try_send(rdev::Event {
+                        event_type: rdev_event_type,
+                        time: std::time::SystemTime::now(),
+                        name: None,
+                    });
+                    None
+                },
+            );
+
+            match tap {
+                Ok(tap) => {
+                    let loop_source = tap
+                        .mach_port
+                        .create_runloop_source(0)
+                        .expect("create CGEventTap run loop source");
+                    let current_loop = CFRunLoop::get_current();
+                    unsafe {
+                        current_loop.add_source(&loop_source, kCFRunLoopCommonModes);
+                    }
+                    tap.enable();
+                    CFRunLoop::run_current();
+                    warn!("CGEventTap run loop exited unexpectedly");
+                }
+                Err(()) => {
+                    warn!("failed to create CGEventTap — check Accessibility/Input Monitoring permissions");
+                }
+            }
+        })
+        .expect("spawn CGEventTap thread");
+}
+
+/// Returns `true` if the modifier key with the given CGKeyCode is currently
+/// active in `flags`. Used to synthesise press/release from `FlagsChanged`.
+#[cfg(target_os = "macos")]
+fn modifier_key_pressed(keycode: u16, flags: CGEventFlags) -> bool {
+    match keycode {
+        56 | 60 => flags.contains(CGEventFlags::CGEventFlagShift),
+        59 | 62 => flags.contains(CGEventFlags::CGEventFlagControl),
+        58 | 61 => flags.contains(CGEventFlags::CGEventFlagAlternate),
+        55 | 54 => flags.contains(CGEventFlags::CGEventFlagCommand),
+        57 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
+        63 => flags.contains(CGEventFlags::CGEventFlagSecondaryFn),
+        _ => false,
+    }
+}
+
+/// Inversion of `rdev_key_to_macos_vk`: maps a macOS CGKeyCode to the
+/// corresponding `rdev::Key` without consulting Text Input Services.
+#[cfg(target_os = "macos")]
+fn cg_keycode_to_rdev_key(keycode: u16) -> Option<rdev::Key> {
+    use rdev::Key;
+    let key = match keycode {
+        0 => Key::KeyA,
+        1 => Key::KeyS,
+        2 => Key::KeyD,
+        3 => Key::KeyF,
+        4 => Key::KeyH,
+        5 => Key::KeyG,
+        6 => Key::KeyZ,
+        7 => Key::KeyX,
+        8 => Key::KeyC,
+        9 => Key::KeyV,
+        10 => Key::IntlBackslash,
+        11 => Key::KeyB,
+        12 => Key::KeyQ,
+        13 => Key::KeyW,
+        14 => Key::KeyE,
+        15 => Key::KeyR,
+        16 => Key::KeyY,
+        17 => Key::KeyT,
+        18 => Key::Num1,
+        19 => Key::Num2,
+        20 => Key::Num3,
+        21 => Key::Num4,
+        22 => Key::Num6,
+        23 => Key::Num5,
+        24 => Key::Equal,
+        25 => Key::Num9,
+        26 => Key::Num7,
+        27 => Key::Minus,
+        28 => Key::Num8,
+        29 => Key::Num0,
+        30 => Key::RightBracket,
+        31 => Key::KeyO,
+        32 => Key::KeyU,
+        33 => Key::LeftBracket,
+        34 => Key::KeyI,
+        35 => Key::KeyP,
+        36 => Key::Return,
+        37 => Key::KeyL,
+        38 => Key::KeyJ,
+        39 => Key::Quote,
+        40 => Key::KeyK,
+        41 => Key::SemiColon,
+        42 => Key::BackSlash,
+        43 => Key::Comma,
+        44 => Key::Slash,
+        45 => Key::KeyN,
+        46 => Key::KeyM,
+        47 => Key::Dot,
+        48 => Key::Tab,
+        49 => Key::Space,
+        50 => Key::BackQuote,
+        51 => Key::Backspace,
+        53 => Key::Escape,
+        54 => Key::MetaRight,
+        55 => Key::MetaLeft,
+        56 => Key::ShiftLeft,
+        57 => Key::CapsLock,
+        58 => Key::Alt,
+        59 => Key::ControlLeft,
+        60 => Key::ShiftRight,
+        61 => Key::AltGr,
+        62 => Key::ControlRight,
+        63 => Key::Function,
+        65 => Key::KpDelete,
+        67 => Key::KpMultiply,
+        69 => Key::KpPlus,
+        71 => Key::NumLock,
+        75 => Key::KpDivide,
+        76 => Key::KpReturn,
+        78 => Key::KpMinus,
+        82 => Key::Kp0,
+        83 => Key::Kp1,
+        84 => Key::Kp2,
+        85 => Key::Kp3,
+        86 => Key::Kp4,
+        87 => Key::Kp5,
+        88 => Key::Kp6,
+        89 => Key::Kp7,
+        91 => Key::Kp8,
+        92 => Key::Kp9,
+        96 => Key::F5,
+        97 => Key::F6,
+        98 => Key::F7,
+        99 => Key::F3,
+        100 => Key::F8,
+        101 => Key::F9,
+        103 => Key::F11,
+        109 => Key::F10,
+        111 => Key::F12,
+        114 => Key::Insert,
+        115 => Key::Home,
+        116 => Key::PageUp,
+        117 => Key::Delete,
+        118 => Key::F4,
+        119 => Key::End,
+        120 => Key::F2,
+        121 => Key::PageDown,
+        122 => Key::F1,
+        123 => Key::LeftArrow,
+        124 => Key::RightArrow,
+        125 => Key::DownArrow,
+        126 => Key::UpArrow,
+        _ => return None,
+    };
+    Some(key)
 }
 
 #[cfg(target_os = "macos")]

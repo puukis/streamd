@@ -50,7 +50,7 @@ impl InputCapture {
             .name("streamd-input-capture".into())
             .spawn(move || run_capture(event_tx, worker_captured, worker_shutdown))?;
 
-        info!("input capture ready; press Ctrl+Alt+Delete to enable mouse capture");
+        info!("input capture ready; press Ctrl+Option+M to toggle mouse capture");
 
         Ok(Self { captured, shutdown })
     }
@@ -278,7 +278,7 @@ impl CaptureState {
     }
 
     fn should_toggle_capture(&self, key: rdev::Key) -> bool {
-        key == rdev::Key::Delete
+        key == rdev::Key::KeyM
             && self.modifiers.contains(KeyModifiers::CTRL)
             && self.modifiers.contains(KeyModifiers::ALT)
     }

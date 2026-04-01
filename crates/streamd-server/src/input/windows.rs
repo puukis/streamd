@@ -21,7 +21,6 @@ impl WindowsInputInjector {
 
 #[cfg(target_os = "windows")]
 fn inject_loop(packet_rx: Receiver<InputPacket>) {
-    use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
     info!("Windows input injection thread started");
@@ -69,14 +68,15 @@ fn inject_loop(packet_rx: Receiver<InputPacket>) {
             }
             InputEvent::MouseScroll { dx, dy } => {
                 let mut inputs = Vec::new();
-                if dy.abs() > 0.01 {
+                let vertical_delta = ((-dy) * 120.0).round() as i32;
+                if vertical_delta != 0 {
                     inputs.push(INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
                                 dx: 0,
                                 dy: 0,
-                                mouseData: ((-dy) * 120.0) as u32,
+                                mouseData: vertical_delta as u32,
                                 dwFlags: MOUSEEVENTF_WHEEL,
                                 time: 0,
                                 dwExtraInfo: 0,
@@ -84,14 +84,15 @@ fn inject_loop(packet_rx: Receiver<InputPacket>) {
                         },
                     });
                 }
-                if dx.abs() > 0.01 {
+                let horizontal_delta = (dx * 120.0).round() as i32;
+                if horizontal_delta != 0 {
                     inputs.push(INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
                                 dx: 0,
                                 dy: 0,
-                                mouseData: (dx * 120.0) as u32,
+                                mouseData: horizontal_delta as u32,
                                 dwFlags: MOUSEEVENTF_HWHEEL,
                                 time: 0,
                                 dwExtraInfo: 0,

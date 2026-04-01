@@ -228,7 +228,7 @@ impl CaptureState {
         self.send_event(
             InputEvent::MouseScroll {
                 dx: delta_x as f32,
-                dy: delta_y as f32,
+                dy: -(delta_y as f32),
             },
             timestamp_us,
         );
@@ -602,10 +602,7 @@ fn rdev_key_to_macos_vk(key: rdev::Key) -> Option<u16> {
 /// on-screen cursor, so `event.location()` always returns the frozen position
 /// (delta = 0). Using the raw delta fields bypasses the frozen cursor.
 #[cfg(target_os = "macos")]
-fn spawn_cg_event_tap(
-    raw_tx: crossbeam_channel::Sender<rdev::Event>,
-    captured: Arc<AtomicBool>,
-) {
+fn spawn_cg_event_tap(raw_tx: crossbeam_channel::Sender<rdev::Event>, captured: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("streamd-cg-event-tap".into())
         .spawn(move || {

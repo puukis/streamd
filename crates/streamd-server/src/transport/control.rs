@@ -12,7 +12,7 @@ use streamd_proto::{
     input::decode_packet,
     packets::{
         Codec, ControlMsg, DisplayInfo, InputPacket, SessionAccept, SessionReject, SessionRequest,
-        PROTOCOL_VERSION,
+        VideoTransport, PROTOCOL_VERSION,
     },
 };
 use tracing::{debug, error, info, warn};
@@ -132,20 +132,18 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
         req.height.max(480).min(4320)
     };
 
-    // Video UDP port: server binds on (control_port + 1)
-    let video_port: u16 = conn.local_ip().map(|_| 9001u16).unwrap_or(9001);
-
     let accept = SessionAccept {
         codec,
         fps,
         width,
         height,
-        video_udp_port: video_port,
-        client_video_udp_port: video_port,
+        // Video is always delivered as QUIC datagrams on this connection —
+        // no additional port or socket is required on either end.
+        video_transport: VideoTransport::QuicDatagram,
         selected_display: selected_display.clone(),
     };
     info!(
-        "session accepted: {codec:?} {width}x{height}@{fps}fps display={} ({}) → udp:{video_port}",
+        "session accepted: {codec:?} {width}x{height}@{fps}fps display={} ({}) → QUIC datagrams",
         selected_display.name, selected_display.id
     );
     send_msg(&mut send, ControlMsg::SessionAccept(accept)).await?;
@@ -170,24 +168,23 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
         }
     });
 
-    // Start the pipeline (capture + encode + send)
-    let video_remote = SocketAddr::new(remote.ip(), video_port);
-
+    // Start the pipeline (capture → encode → QUIC datagram send).
+    // Pass the connection so the pipeline thread can call conn.send_datagram()
+    // directly from the non-async pipeline thread.
     let mut pipeline = PipelineHandle::start(
         codec,
         fps,
         width,
         height,
         Some(selected_display.id.clone()),
-        video_port,
-        video_remote,
+        conn.clone(),
     )?;
     let mut telemetry_rx = pipeline.take_telemetry_rx();
     let mut cursor_rx = pipeline.take_cursor_rx();
 
-    // Control loop: heartbeats + IDR requests
     let mut cursor_datagrams_supported = conn.max_datagram_size().is_some();
 
+    // Control loop: heartbeats + IDR requests
     loop {
         tokio::select! {
             msg = read_control_msg(&mut recv) => {
@@ -245,7 +242,6 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
 
 fn negotiate_codec(req: &SessionRequest) -> Codec {
     for &c in &req.preferred_codecs {
-        // Server supports H264 and Hevc
         if matches!(c, Codec::H264 | Codec::Hevc) {
             return c;
         }
@@ -270,7 +266,6 @@ fn resolve_display(displays: &[DisplayInfo], requested_id: Option<&str>) -> Resu
 }
 
 async fn read_control_msg(recv: &mut RecvStream) -> Result<ControlMsg> {
-    // Read 4-byte length prefix
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await.context("read length")?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -340,8 +335,11 @@ fn make_server_endpoint(bind_addr: SocketAddr) -> Result<Endpoint> {
     let mut server_config = ServerConfig::with_single_cert(vec![cert_der], key_der)
         .context("build server TLS config")?;
     let mut transport_config = TransportConfig::default();
-    transport_config.datagram_receive_buffer_size(Some(64 * 1024));
-    transport_config.datagram_send_buffer_size(64 * 1024);
+    // Send buffer large enough to absorb a full keyframe burst at high bitrate
+    // before the congestion window catches up (~4 MB covers several 1080p IDR frames).
+    transport_config.datagram_send_buffer_size(4 * 1024 * 1024);
+    // Receive buffer for incoming cursor or future client datagrams.
+    transport_config.datagram_receive_buffer_size(Some(256 * 1024));
     server_config.transport_config(Arc::new(transport_config));
 
     let endpoint = Endpoint::server(server_config, bind_addr).context("create QUIC endpoint")?;

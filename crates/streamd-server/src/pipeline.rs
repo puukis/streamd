@@ -1,4 +1,4 @@
-//! Pipeline orchestration: capture → encode → UDP send.
+//! Pipeline orchestration: capture → encode → QUIC datagram send.
 //!
 //! The pipeline runs on a dedicated OS thread pinned to physical cores 0-3
 //! with SCHED_FIFO priority 50 to prevent kernel preemption mid-frame.
@@ -7,11 +7,10 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use streamd_proto::packets::{Codec, ServerTelemetry, MTU_WAN};
+use streamd_proto::packets::{Codec, ServerTelemetry};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
 
@@ -21,7 +20,7 @@ use crate::capture::wayland::{CaptureMode, WaylandCapture};
 use crate::capture::windows::WindowsCapture;
 use crate::capture::{CaptureFrame, CaptureStats, CursorEvent};
 use crate::encode::nvenc::{NvencConfig, NvencEncoder};
-use crate::transport::video_tx::VideoSender;
+use crate::transport::video_tx::QuicVideoSender;
 
 /// Statistics tracked by the pipeline thread for telemetry.
 struct Stats {
@@ -104,14 +103,19 @@ pub struct PipelineHandle {
 }
 
 impl PipelineHandle {
+    /// Spawn the capture → encode → send pipeline on a dedicated OS thread.
+    ///
+    /// `conn` is the QUIC connection to the client. The pipeline thread calls
+    /// `conn.send_datagram()` directly; `quinn::Connection::send_datagram` is
+    /// a synchronous, thread-safe method that enqueues the datagram and wakes
+    /// the quinn driver task running on the Tokio runtime.
     pub fn start(
         codec: Codec,
         fps: u8,
         width: u32,
         height: u32,
         display_id: Option<String>,
-        video_port: u16,
-        remote: SocketAddr,
+        conn: quinn::Connection,
     ) -> Result<Self> {
         let idr_requested = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -134,8 +138,7 @@ impl PipelineHandle {
                     width,
                     height,
                     display_id,
-                    video_port,
-                    remote,
+                    conn,
                     idr_flag,
                     stop,
                     telemetry_tx,
@@ -181,7 +184,6 @@ fn apply_realtime_scheduling() {
     use nix::sched::{sched_setaffinity, CpuSet};
     use nix::unistd::Pid;
 
-    // Pin to physical cores 0-3 (avoids SMT sibling contention)
     let mut cpuset = CpuSet::new();
     for i in 0..4 {
         let _ = cpuset.set(i);
@@ -190,7 +192,6 @@ fn apply_realtime_scheduling() {
         warn!("sched_setaffinity failed: {e} — continuing without core pinning");
     }
 
-    // SCHED_FIFO priority 50: prevents preemption mid-frame
     #[cfg(target_os = "linux")]
     unsafe {
         let param = nix::libc::sched_param { sched_priority: 50 };
@@ -217,8 +218,7 @@ fn pipeline_thread(
     width: u32,
     height: u32,
     display_id: Option<String>,
-    video_port: u16,
-    remote: SocketAddr,
+    conn: quinn::Connection,
     idr_requested: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     telemetry_tx: UnboundedSender<ServerTelemetry>,
@@ -230,8 +230,7 @@ fn pipeline_thread(
         width,
         height,
         display_id,
-        video_port,
-        remote,
+        conn,
         idr_requested,
         stop_flag,
         telemetry_tx,
@@ -247,25 +246,22 @@ fn run_pipeline_thread(
     width: u32,
     height: u32,
     display_id: Option<String>,
-    video_port: u16,
-    remote: SocketAddr,
+    conn: quinn::Connection,
     idr_requested: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     telemetry_tx: UnboundedSender<ServerTelemetry>,
     cursor_tx: UnboundedSender<CursorEvent>,
 ) -> Result<()> {
     info!(
-        "pipeline thread: {codec:?} {width}x{height}@{fps}fps display={} → {remote} udp:{video_port}",
+        "pipeline thread: {codec:?} {width}x{height}@{fps}fps display={} → QUIC datagrams",
         display_id.as_deref().unwrap_or("default")
     );
 
     let frame_interval = Duration::from_nanos(1_000_000_000 / fps as u64);
 
-    // Set up UDP sender
-    let sender = VideoSender::new(video_port, remote, false).context("create UDP sender")?;
-
-    // Stay on the conservative payload size unless jumbo support is explicitly negotiated.
-    info!("video sender using conservative UDP MTU (~{MTU_WAN} bytes)");
+    // QuicVideoSender queries max_datagram_size() from the connection to size
+    // fragments appropriately for the negotiated path MTU.
+    let mut sender = QuicVideoSender::new(conn);
 
     let mut stats = Stats::new();
     let mut frame_seq: u32 = 0;
@@ -618,8 +614,7 @@ fn run_pipeline_thread(
             width,
             height,
             display_id,
-            video_port,
-            remote,
+            conn,
             idr_requested,
             stop_flag,
             telemetry_tx,
@@ -643,7 +638,7 @@ fn encoder_config(codec: Codec, width: u32, height: u32, fps: u8) -> NvencConfig
 #[cfg(target_os = "linux")]
 fn initialise_wayland_capture(
     display_id: Option<&str>,
-    frame_tx: &Sender<CaptureFrame>,
+    frame_tx: &crossbeam_channel::Sender<CaptureFrame>,
     frame_rx: &Receiver<CaptureFrame>,
 ) -> Result<(CaptureMode, WaylandCapture, CaptureFrame)> {
     match WaylandCapture::new(CaptureMode::DmaBuf, display_id, frame_tx.clone()) {

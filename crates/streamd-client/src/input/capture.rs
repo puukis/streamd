@@ -115,7 +115,7 @@ impl CaptureState {
         // main-thread-only and raises EXC_BREAKPOINT (SIGTRAP) on any other thread.
         // Use a direct CGEventTap instead, bypassing all TIS calls.
         #[cfg(target_os = "macos")]
-        spawn_cg_event_tap(raw_tx);
+        spawn_cg_event_tap(raw_tx, self.captured.clone());
 
         #[cfg(not(target_os = "macos"))]
         let _listen_thread = std::thread::Builder::new()
@@ -595,8 +595,17 @@ fn rdev_key_to_macos_vk(key: rdev::Key) -> Option<u16> {
 /// converted `rdev::Event` values into `raw_tx`. Unlike `rdev::listen`, this
 /// never calls `TISCopyCurrentKeyboardInputSource`, which is main-thread-only
 /// on macOS 14+ and causes EXC_BREAKPOINT when called from a background thread.
+///
+/// `captured` is shared with `CaptureState` so the callback can detect when the
+/// cursor is locked and switch from absolute location to raw delta reporting.
+/// When captured, `CGAssociateMouseAndMouseCursorPosition(false)` freezes the
+/// on-screen cursor, so `event.location()` always returns the frozen position
+/// (delta = 0). Using the raw delta fields bypasses the frozen cursor.
 #[cfg(target_os = "macos")]
-fn spawn_cg_event_tap(raw_tx: crossbeam_channel::Sender<rdev::Event>) {
+fn spawn_cg_event_tap(
+    raw_tx: crossbeam_channel::Sender<rdev::Event>,
+    captured: Arc<AtomicBool>,
+) {
     std::thread::Builder::new()
         .name("streamd-cg-event-tap".into())
         .spawn(move || {
@@ -621,6 +630,7 @@ fn spawn_cg_event_tap(raw_tx: crossbeam_channel::Sender<rdev::Event>) {
                     CGEventType::ScrollWheel,
                 ],
                 move |_proxy, ev_type, event| {
+                    let is_captured = captured.load(Ordering::Relaxed);
                     let rdev_event_type = match ev_type {
                         CGEventType::KeyDown | CGEventType::KeyUp => {
                             let keycode = event
@@ -676,7 +686,25 @@ fn spawn_cg_event_tap(raw_tx: crossbeam_channel::Sender<rdev::Event>) {
                         | CGEventType::RightMouseDragged
                         | CGEventType::OtherMouseDragged => {
                             let loc = event.location();
-                            rdev::EventType::MouseMove { x: loc.x, y: loc.y }
+                            if is_captured {
+                                // Cursor is frozen by CGAssociateMouseAndMouseCursorPosition.
+                                // event.location() returns the fixed frozen position, so
+                                // subtracting the center would always give zero delta.
+                                // Use raw mouse delta fields and add them to the frozen
+                                // cursor position so handle_mouse_move computes real deltas.
+                                let rdx = event.get_integer_value_field(
+                                    EventField::MOUSE_EVENT_DELTA_X,
+                                ) as f64;
+                                let rdy = event.get_integer_value_field(
+                                    EventField::MOUSE_EVENT_DELTA_Y,
+                                ) as f64;
+                                rdev::EventType::MouseMove {
+                                    x: loc.x + rdx,
+                                    y: loc.y + rdy,
+                                }
+                            } else {
+                                rdev::EventType::MouseMove { x: loc.x, y: loc.y }
+                            }
                         }
                         CGEventType::ScrollWheel => {
                             let dx = event.get_integer_value_field(

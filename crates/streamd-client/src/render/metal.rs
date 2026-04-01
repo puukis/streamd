@@ -429,7 +429,10 @@ fn present_frame(state: &mut RendererState, frame: &RenderFrame) -> Result<()> {
 
     let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_render_command_encoder(pass_descriptor);
-    let vertices = fullscreen_vertices(y_cv_texture.is_flipped());
+    // CVMetalTextureIsFlipped() returns false for VideoToolbox IOSurface-backed
+    // frames on macOS — but the vertex tex-coord mapping in fullscreen_vertices
+    // treats `flipped=true` as "compensate for flipped data", so we must negate.
+    let vertices = fullscreen_vertices(!y_cv_texture.is_flipped());
     let conversion = ColorConversionParams {
         full_range: full_range as u32,
     };

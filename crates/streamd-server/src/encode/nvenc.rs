@@ -1,14 +1,14 @@
 //! NVENC encoder — direct SDK usage via bindgen-generated bindings.
 //!
-//! # Prerequisites
+//! # Header setup
 //!
-//! ```sh
-//! git clone https://github.com/FFmpeg/nv-codec-headers
-//! cd nv-codec-headers && sudo make install   # → /usr/local/include/ffnvcodec/
-//! ```
+//! The repo vendors `nvEncodeAPI.h` under
+//! `third_party/nv-codec-headers/include/ffnvcodec/` and uses it by default.
+//! Set `NVENC_HEADER_PATH` or `NVENC_INCLUDE_DIR` if you need to override that
+//! with a different SDK revision.
 //!
-//! `build.rs` then generates `nvenc_bindings.rs` via bindgen and sets the
-//! `have_nvenc` cfg flag. This file compiles only when that flag is set.
+//! `build.rs` generates `nvenc_bindings.rs` via bindgen and sets the
+//! `have_nvenc` cfg flag. This file compiles only when the header was found.
 //!
 //! # Key latency parameters
 //!
@@ -1467,8 +1467,9 @@ pub struct NvencEncoder;
 impl NvencEncoder {
     pub fn new(_config: NvencConfig) -> Result<Self> {
         anyhow::bail!(
-            "NVENC not available — download nv-codec-headers and rebuild.\n\
-             See: https://github.com/FFmpeg/nv-codec-headers"
+            "NVENC not available — nvEncodeAPI.h could not be located.\n\
+             The repo normally vendors it under third_party/nv-codec-headers.\n\
+             Override with NVENC_HEADER_PATH or NVENC_INCLUDE_DIR and rebuild."
         )
     }
 

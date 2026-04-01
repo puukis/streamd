@@ -1,6 +1,11 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+struct NvencHeaderLocation {
+    header: PathBuf,
+    include_dir: PathBuf,
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(have_nvenc)");
@@ -11,36 +16,72 @@ fn main() {
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    if let Some(header) = locate_nvenc_header(&target_os) {
-        let include_dir = env::var_os("NVENC_INCLUDE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| header.parent().map(Path::to_path_buf));
-        generate_nvenc_bindings(&header, include_dir.as_deref());
+    if let Some(location) = locate_nvenc_header(&target_os) {
+        generate_nvenc_bindings(&location.header, Some(location.include_dir.as_path()));
         emit_nvenc_link_instructions(&target_os);
     } else {
         println!("cargo:warning=NVENC headers were not found for target {target_os}");
         println!(
-            "cargo:warning=Set NVENC_HEADER_PATH or install nvEncodeAPI.h in a standard location."
+            "cargo:warning=Set NVENC_HEADER_PATH, NVENC_INCLUDE_DIR, or restore the vendored nvEncodeAPI.h."
         );
     }
 }
 
-fn locate_nvenc_header(target_os: &str) -> Option<PathBuf> {
+fn locate_nvenc_header(target_os: &str) -> Option<NvencHeaderLocation> {
     if let Some(path) = env::var_os("NVENC_HEADER_PATH").map(PathBuf::from) {
-        return path.exists().then_some(path);
+        return path.exists().then(|| NvencHeaderLocation {
+            include_dir: path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            header: path,
+        });
+    }
+
+    if let Some(dir) = env::var_os("NVENC_INCLUDE_DIR").map(PathBuf::from) {
+        if let Some(location) = header_in_include_dir(dir) {
+            return Some(location);
+        }
+    }
+
+    if let Some(location) = header_in_include_dir(vendored_include_dir()) {
+        return Some(location);
     }
 
     match target_os {
-        "linux" => {
-            let path = PathBuf::from("/usr/local/include/ffnvcodec/nvEncodeAPI.h");
-            path.exists().then_some(path)
-        }
+        "linux" => header_in_include_dir(PathBuf::from("/usr/local/include")),
         "windows" => env::var_os("CUDA_PATH")
             .map(PathBuf::from)
-            .map(|cuda| cuda.join("include").join("nvEncodeAPI.h"))
-            .filter(|path| path.exists()),
+            .and_then(|cuda| header_in_include_dir(cuda.join("include"))),
         _ => None,
     }
+}
+
+fn vendored_include_dir() -> PathBuf {
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("streamd-server crate should live under crates/")
+        .join("third_party")
+        .join("nv-codec-headers")
+        .join("include")
+}
+
+fn header_in_include_dir(include_dir: PathBuf) -> Option<NvencHeaderLocation> {
+    let direct = include_dir.join("nvEncodeAPI.h");
+    if direct.exists() {
+        return Some(NvencHeaderLocation {
+            header: direct,
+            include_dir,
+        });
+    }
+
+    let nested = include_dir.join("ffnvcodec").join("nvEncodeAPI.h");
+    nested.exists().then_some(NvencHeaderLocation {
+        header: nested,
+        include_dir,
+    })
 }
 
 fn emit_nvenc_link_instructions(target_os: &str) {

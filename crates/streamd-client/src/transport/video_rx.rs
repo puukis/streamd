@@ -1,16 +1,18 @@
-//! UDP video receiver: reassembles fragmented frames and hands them to the decoder.
+//! Video frame reassembly from QUIC unreliable datagrams.
+//!
+//! The server sends each encoded frame as one or more datagram fragments, each
+//! carrying an 18-byte `VideoPacketHeader` followed by compressed video data.
+//! `VideoFrameReassembler` accumulates those fragments and emits a complete
+//! `DecodedFrame` once every fragment of every slice in a frame has arrived.
+//!
+//! Because QUIC datagrams are unreliable, fragments can be lost. The receiver
+//! evicts any incomplete frames whose sequence number falls more than 64
+//! frames behind the latest completed frame, allowing the decoder to recover
+//! by requesting an IDR (keyframe) from the server.
 
-use anyhow::{Context, Result};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, info};
 
 use streamd_proto::packets::parse_video_header as parse_header;
 
@@ -22,81 +24,13 @@ pub struct DecodedFrame {
     pub frame_seq: u32,
     pub timestamp_us: u64,
     pub is_keyframe: bool,
+    /// Local wall-clock time (µs since Unix epoch) when the frame was fully
+    /// reassembled. Used to measure end-to-end latency.
     pub received_at_us: u64,
-}
-
-pub struct VideoReceiver {
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl VideoReceiver {
-    pub fn start(
-        local_port: u16,
-        server_ip: IpAddr,
-    ) -> Result<(Self, crossbeam_channel::Receiver<DecodedFrame>)> {
-        let bind_addr: SocketAddr = format!("0.0.0.0:{local_port}").parse()?;
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-            .context("create UDP recv socket")?;
-
-        socket.set_reuse_address(true)?;
-        socket.set_recv_buffer_size(8 * 1024 * 1024)?;
-        // SO_BUSY_POLL: busy-wait up to 50µs before blocking, keeping the path hot.
-        // setsockopt(SO_BUSY_POLL, 50) — available on Linux only.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-            let val: libc::c_int = 50;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_BUSY_POLL,
-                    &val as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&val) as libc::socklen_t,
-                );
-            }
-        }
-        socket.bind(&bind_addr.into())?;
-        let udp: std::net::UdpSocket = socket.into();
-        udp.set_read_timeout(Some(Duration::from_millis(100)))?;
-
-        info!("video receiver listening on {bind_addr} for server {server_ip}");
-
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded(8);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
-
-        let thread = std::thread::Builder::new()
-            .name("streamd-video-rx".into())
-            .spawn(move || {
-                receive_loop(udp, frame_tx, stop_clone);
-            })
-            .context("spawn video receive thread")?;
-
-        Ok((
-            Self {
-                stop,
-                thread: Some(thread),
-            },
-            frame_rx,
-        ))
-    }
-}
-
-impl Drop for VideoReceiver {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
 /// Per-frame reassembly state.
 struct FrameState {
-    /// slice_idx → vec of (frag_idx, data) pairs
     slices: HashMap<u8, SliceState>,
     num_slices_expected: Option<u8>,
     timestamp_us: u64,
@@ -107,42 +41,6 @@ struct SliceState {
     frags: Vec<Option<Vec<u8>>>,
     received: u16,
     total: u16,
-}
-
-struct ReceiverStats {
-    assembled_frames: u32,
-    dropped_frames: u32,
-    window_started_at: Instant,
-}
-
-impl ReceiverStats {
-    fn new() -> Self {
-        Self {
-            assembled_frames: 0,
-            dropped_frames: 0,
-            window_started_at: Instant::now(),
-        }
-    }
-
-    fn record_assembled(&mut self) {
-        self.assembled_frames += 1;
-    }
-
-    fn record_dropped(&mut self) {
-        self.dropped_frames += 1;
-    }
-
-    fn maybe_log(&mut self) {
-        if self.window_started_at.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-
-        info!(
-            "video receiver telemetry: assembled={} dropped={}",
-            self.assembled_frames, self.dropped_frames
-        );
-        *self = Self::new();
-    }
 }
 
 impl SliceState {
@@ -174,63 +72,90 @@ impl SliceState {
     }
 }
 
-fn receive_loop(
-    socket: std::net::UdpSocket,
-    frame_tx: crossbeam_channel::Sender<DecodedFrame>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut buf = vec![0u8; 64 * 1024];
-    // Circular buffer of reassembly state, indexed by frame_seq % 128
-    let mut frames: HashMap<u32, FrameState> = HashMap::new();
-    let mut first_packet_logged = false;
-    let mut first_fragment_logged = false;
-    let mut first_parse_failure_logged = false;
-    let mut first_frame_logged = false;
-    let mut receiver_stats = ReceiverStats::new();
+/// Statistics window logged once per second.
+struct ReassemblerStats {
+    assembled_frames: u32,
+    dropped_frames: u32,
+    window_started_at: std::time::Instant,
+}
 
-    while !stop.load(Ordering::Relaxed) {
-        let (n, peer) = match socket.recv_from(&mut buf) {
-            Ok(result) => result,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-            Err(e) => {
-                debug!("UDP recv error: {e}");
-                continue;
-            }
-        };
-
-        if !first_packet_logged {
-            info!("video receiver received first UDP datagram from {peer} ({n} bytes)");
-            first_packet_logged = true;
+impl ReassemblerStats {
+    fn new() -> Self {
+        Self {
+            assembled_frames: 0,
+            dropped_frames: 0,
+            window_started_at: std::time::Instant::now(),
         }
+    }
 
-        let Some((hdr, payload)) = parse_header(&buf[..n]) else {
-            if !first_parse_failure_logged {
-                warn!("video receiver dropped unparsable UDP datagram from {peer} ({n} bytes)");
-                first_parse_failure_logged = true;
-            }
-            continue;
+    fn record_assembled(&mut self) {
+        self.assembled_frames += 1;
+    }
+
+    fn record_dropped(&mut self) {
+        self.dropped_frames += 1;
+    }
+
+    fn maybe_log(&mut self) {
+        if self.window_started_at.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        info!(
+            "video reassembler: assembled={} dropped={}",
+            self.assembled_frames, self.dropped_frames
+        );
+        *self = Self::new();
+    }
+}
+
+/// Stateful reassembler that turns a stream of raw datagram payloads (the
+/// bytes *after* the `DATAGRAM_TAG_VIDEO` byte has been stripped) into
+/// complete `DecodedFrame`s.
+///
+/// Call `push_datagram` for each video datagram payload received from
+/// `Connection::read_datagram`. It returns `Some(frame)` when the last
+/// fragment of a frame arrives, `None` otherwise.
+pub struct VideoFrameReassembler {
+    /// In-flight reassembly state, keyed by `frame_seq`.
+    frames: HashMap<u32, FrameState>,
+    stats: ReassemblerStats,
+    first_fragment_logged: bool,
+    first_frame_logged: bool,
+}
+
+impl VideoFrameReassembler {
+    pub fn new() -> Self {
+        Self {
+            frames: HashMap::new(),
+            stats: ReassemblerStats::new(),
+            first_fragment_logged: false,
+            first_frame_logged: false,
+        }
+    }
+
+    /// Feed one datagram payload (tag byte already stripped).
+    ///
+    /// Returns `Some(frame)` when a complete frame is assembled, `None`
+    /// while waiting for more fragments.
+    pub fn push_datagram(&mut self, data: &[u8]) -> Option<DecodedFrame> {
+        let Some((hdr, payload)) = parse_header(data) else {
+            debug!("video reassembler: unparsable datagram ({} bytes)", data.len());
+            return None;
         };
 
-        if !first_fragment_logged {
+        if !self.first_fragment_logged {
             info!(
-                "video receiver accepted first fragment seq={} slice={} frag={}/{} keyframe={}",
+                "video reassembler: first fragment seq={} slice={} frag={}/{} keyframe={}",
                 hdr.frame_seq,
                 hdr.slice_idx,
                 hdr.frag_idx + 1,
                 hdr.frag_total,
                 hdr.is_keyframe()
             );
-            first_fragment_logged = true;
+            self.first_fragment_logged = true;
         }
 
-        let entry = frames.entry(hdr.frame_seq).or_insert_with(|| FrameState {
+        let entry = self.frames.entry(hdr.frame_seq).or_insert_with(|| FrameState {
             slices: HashMap::new(),
             num_slices_expected: None,
             timestamp_us: hdr.timestamp_us,
@@ -248,58 +173,58 @@ fn receive_loop(
 
         slice.insert(hdr.frag_idx, payload.to_vec());
 
-        // Check if all slices in this frame are complete
+        // Check if every slice of this frame is complete.
         let all_complete = if let Some(total) = entry.num_slices_expected {
             (0..total).all(|i| entry.slices.get(&i).map_or(false, |s| s.is_complete()))
         } else {
             false
         };
 
-        if all_complete {
-            // Assemble slices in order
-            let state = frames.remove(&hdr.frame_seq).unwrap();
-            let mut data = Vec::new();
-            let mut slice_ids: Vec<u8> = state.slices.keys().copied().collect();
-            slice_ids.sort_unstable();
-            for id in slice_ids {
-                data.extend_from_slice(&state.slices[&id].assemble());
-            }
-
-            let received_at_us = now_local_us();
-            match frame_tx.try_send(DecodedFrame {
-                data,
-                frame_seq: hdr.frame_seq,
-                timestamp_us: state.timestamp_us,
-                is_keyframe: state.is_keyframe,
-                received_at_us,
-            }) {
-                Ok(()) => {
-                    receiver_stats.record_assembled();
-                    if !first_frame_logged {
-                        info!(
-                            "video receiver assembled first frame seq={} keyframe={}",
-                            hdr.frame_seq, state.is_keyframe
-                        );
-                        first_frame_logged = true;
-                    }
-                }
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    receiver_stats.record_dropped();
-                }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
-            }
-            receiver_stats.maybe_log();
-
-            // Evict frames older than this one (they will never complete)
-            let seq = hdr.frame_seq;
-            frames.retain(|&k, _| k > seq || seq.wrapping_sub(k) < 64);
+        if !all_complete {
+            return None;
         }
-    }
 
-    info!("video receive thread exited");
+        let state = self.frames.remove(&hdr.frame_seq).unwrap();
+        let mut assembled = Vec::new();
+        let mut slice_ids: Vec<u8> = state.slices.keys().copied().collect();
+        slice_ids.sort_unstable();
+        for id in slice_ids {
+            assembled.extend_from_slice(&state.slices[&id].assemble());
+        }
+
+        let received_at_us = now_us();
+        let frame = DecodedFrame {
+            data: assembled,
+            frame_seq: hdr.frame_seq,
+            timestamp_us: state.timestamp_us,
+            is_keyframe: state.is_keyframe,
+            received_at_us,
+        };
+
+        self.stats.record_assembled();
+        if !self.first_frame_logged {
+            info!(
+                "video reassembler: first complete frame seq={} keyframe={}",
+                hdr.frame_seq, state.is_keyframe
+            );
+            self.first_frame_logged = true;
+        }
+        self.stats.maybe_log();
+
+        // Evict incomplete frames that are too far behind to ever complete.
+        let seq = hdr.frame_seq;
+        let before = self.frames.len();
+        self.frames.retain(|&k, _| k > seq || seq.wrapping_sub(k) < 64);
+        let evicted = before - self.frames.len();
+        for _ in 0..evicted {
+            self.stats.record_dropped();
+        }
+
+        Some(frame)
+    }
 }
 
-fn now_local_us() -> u64 {
+fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

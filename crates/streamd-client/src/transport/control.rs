@@ -1,4 +1,20 @@
 //! QUIC control channel — session handshake, IDR requests, heartbeats.
+//!
+//! After the session is established the client runs three concurrent tasks on
+//! the same QUIC connection:
+//!
+//! 1. **control_loop** — reads the bidirectional control stream for heartbeats
+//!    and cursor shape updates.
+//! 2. **datagram_dispatch_loop** — reads all QUIC unreliable datagrams and
+//!    routes them by the 1-byte type tag defined in `streamd_proto::control`:
+//!    - `DATAGRAM_TAG_VIDEO`  → `VideoFrameReassembler` → decoder
+//!    - `DATAGRAM_TAG_CURSOR` → `RemoteCursorStore`
+//! 3. **forward_input_loop** — a blocking thread that forwards local input
+//!    events to the server over a QUIC unidirectional stream.
+//!
+//! No separate UDP socket is opened. Video flows over the same connection the
+//! client already established for control, so only a single outbound QUIC
+//! connection is required and no inbound ports need to be forwarded.
 
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -11,7 +27,9 @@ use std::sync::{
 };
 use std::time::Duration;
 use streamd_proto::{
-    control::{decode_cursor_datagram, decode_msg, encode_msg},
+    control::{
+        decode_cursor_datagram, decode_msg, encode_msg, DATAGRAM_TAG_CURSOR, DATAGRAM_TAG_VIDEO,
+    },
     input::encode_packet,
     packets::{Codec, ControlMsg, DisplayInfo, InputPacket, SessionRequest, PROTOCOL_VERSION},
 };
@@ -20,7 +38,7 @@ use tracing::{info, warn};
 use crate::cursor::RemoteCursorStore;
 use crate::decode::videotoolbox::{RenderFrame, VideoToolboxDecoder};
 use crate::input::capture::InputCapture;
-use crate::transport::video_rx::VideoReceiver;
+use crate::transport::video_rx::VideoFrameReassembler;
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientOptions {
@@ -39,7 +57,6 @@ pub struct ClientSession {
     input_task: Option<tokio::task::JoinHandle<Result<()>>>,
     control_task: Option<tokio::task::JoinHandle<Result<()>>>,
     datagram_task: Option<tokio::task::JoinHandle<Result<()>>>,
-    video_receiver: Option<VideoReceiver>,
     decoder: Option<VideoToolboxDecoder>,
     cursor_store: Arc<RemoteCursorStore>,
 }
@@ -76,7 +93,6 @@ impl ClientSession {
         }
 
         drop(self.decoder.take());
-        drop(self.video_receiver.take());
 
         if let Some(input_task) = self.input_task.take() {
             match input_task.await {
@@ -97,8 +113,8 @@ impl ClientSession {
         if let Some(datagram_task) = self.datagram_task.take() {
             match datagram_task.await {
                 Ok(Ok(())) => {}
-                Ok(Err(err)) => warn!("cursor datagram task error: {err:#}"),
-                Err(err) => warn!("cursor datagram task join error: {err}"),
+                Ok(Err(err)) => warn!("datagram dispatch task error: {err:#}"),
+                Err(err) => warn!("datagram dispatch task join error: {err}"),
             }
         }
 
@@ -128,7 +144,6 @@ pub async fn connect_client_session(
 ) -> Result<Option<ClientSession>> {
     let endpoint = make_client_endpoint()?;
 
-    // Try LAN direct first, fall back to provided address (Tailscale / WireGuard IP)
     let conn = endpoint
         .connect(server_addr, "streamd")
         .context("QUIC connect")?
@@ -137,12 +152,10 @@ pub async fn connect_client_session(
 
     info!("connected to {}", conn.remote_address());
     info!(
-        "QUIC datagrams {}",
-        if conn.max_datagram_size().is_some() {
-            "enabled"
-        } else {
-            "unavailable"
-        }
+        "QUIC datagrams: max payload {} bytes",
+        conn.max_datagram_size()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unavailable".into())
     );
 
     let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
@@ -175,7 +188,6 @@ pub async fn connect_client_session(
         1080
     };
 
-    // Send SessionRequest
     let req = SessionRequest {
         version: PROTOCOL_VERSION,
         max_fps: 60,
@@ -186,7 +198,6 @@ pub async fn connect_client_session(
     };
     send_msg(&mut send, ControlMsg::SessionRequest(req)).await?;
 
-    // Wait for accept/reject
     let response = read_control_msg(&mut recv).await?;
     let session = match response {
         ControlMsg::SessionAccept(s) => s,
@@ -195,19 +206,19 @@ pub async fn connect_client_session(
     };
 
     info!(
-        "session accepted: {:?} {}x{}@{}fps, display={} ({}), video udp:{}",
+        "session accepted: {:?} {}x{}@{}fps display={} ({}) video: QUIC datagrams",
         session.codec,
         session.width,
         session.height,
         session.fps,
         session.selected_display.name,
         session.selected_display.id,
-        session.video_udp_port
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let cursor_store = Arc::new(RemoteCursorStore::default());
 
+    // Input forwarding: local events → QUIC unidirectional stream → server.
     let input_stream = conn.open_uni().await.context("open input stream")?;
     let (input_tx, input_rx) = crossbeam_channel::bounded(1024);
     let input_capture = InputCapture::start(input_tx)?;
@@ -217,29 +228,30 @@ pub async fn connect_client_session(
         forward_input_loop(input_rx, input_stream, input_runtime, input_shutdown)
     });
 
-    let video_port = session.client_video_udp_port;
-    let (video_receiver, frame_rx) = VideoReceiver::start(video_port, server_addr.ip())?;
-    let (decoder, render_rx) = VideoToolboxDecoder::start(frame_rx)?;
-    let control_shutdown = shutdown.clone();
-    let control_cursor_store = cursor_store.clone();
-    let datagram_shutdown = shutdown.clone();
+    // Video + cursor datagrams: single dispatch loop routes by type tag.
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<crate::transport::video_rx::DecodedFrame>(8);
     let datagram_conn = conn.clone();
     let datagram_cursor_store = cursor_store.clone();
+    let datagram_shutdown = shutdown.clone();
+    let datagram_task = tokio::spawn(async move {
+        let result =
+            datagram_dispatch_loop(datagram_conn, datagram_cursor_store, frame_tx).await;
+        datagram_shutdown.store(true, Ordering::Relaxed);
+        if let Err(err) = &result {
+            warn!("datagram dispatch loop ended: {err:#}");
+        }
+        result
+    });
 
+    let (decoder, render_rx) = VideoToolboxDecoder::start(frame_rx)?;
+
+    let control_shutdown = shutdown.clone();
+    let control_cursor_store = cursor_store.clone();
     let control_task = tokio::spawn(async move {
         let result = control_loop(recv, control_cursor_store).await;
         control_shutdown.store(true, Ordering::Relaxed);
         if let Err(err) = &result {
             warn!("control loop ended: {err:#}");
-        }
-        result
-    });
-
-    let datagram_task = tokio::spawn(async move {
-        let result = cursor_datagram_loop(datagram_conn, datagram_cursor_store).await;
-        datagram_shutdown.store(true, Ordering::Relaxed);
-        if let Err(err) = &result {
-            warn!("cursor datagram loop ended: {err:#}");
         }
         result
     });
@@ -255,10 +267,66 @@ pub async fn connect_client_session(
         input_task: Some(input_task),
         control_task: Some(control_task),
         datagram_task: Some(datagram_task),
-        video_receiver: Some(video_receiver),
         decoder: Some(decoder),
         cursor_store,
     }))
+}
+
+/// Reads all QUIC unreliable datagrams on the connection and dispatches them
+/// by type tag.
+///
+/// - `DATAGRAM_TAG_VIDEO`  → reassembled into `DecodedFrame` and sent to the decoder.
+/// - `DATAGRAM_TAG_CURSOR` → cursor position/visibility applied to `RemoteCursorStore`.
+///
+/// Both cursor state and video fragments arrive on the same connection, so a
+/// single `read_datagram()` call sees them interleaved. The 1-byte tag is
+/// stripped before handing the payload to each handler.
+async fn datagram_dispatch_loop(
+    conn: quinn::Connection,
+    cursor_store: Arc<RemoteCursorStore>,
+    frame_tx: crossbeam_channel::Sender<crate::transport::video_rx::DecodedFrame>,
+) -> Result<()> {
+    let mut reassembler = VideoFrameReassembler::new();
+
+    loop {
+        let bytes = match conn.read_datagram().await {
+            Ok(b) => b,
+            Err(err) => {
+                info!("datagram dispatch loop stopped: {err}");
+                break;
+            }
+        };
+
+        match bytes.first() {
+            Some(&DATAGRAM_TAG_VIDEO) => {
+                // Strip the tag byte and feed the rest to the reassembler.
+                if let Some(frame) = reassembler.push_datagram(&bytes[1..]) {
+                    match frame_tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(crossbeam_channel::TrySendError::Full(_)) => {
+                            // Decoder is falling behind; drop the frame.
+                        }
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+            }
+            Some(&DATAGRAM_TAG_CURSOR) => {
+                if let Some(state) = decode_cursor_datagram(&bytes) {
+                    cursor_store.apply_state(state);
+                } else {
+                    warn!("received malformed cursor datagram ({} bytes)", bytes.len());
+                }
+            }
+            Some(&tag) => {
+                warn!("received datagram with unknown type tag {tag:#04x} — ignoring");
+            }
+            None => {
+                warn!("received empty datagram — ignoring");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn select_display(displays: &[DisplayInfo], selector: Option<&str>) -> Result<DisplayInfo> {
@@ -358,29 +426,6 @@ async fn control_loop(
     Ok(())
 }
 
-async fn cursor_datagram_loop(
-    conn: quinn::Connection,
-    cursor_store: Arc<RemoteCursorStore>,
-) -> Result<()> {
-    loop {
-        match conn.read_datagram().await {
-            Ok(bytes) => {
-                if let Some(state) = decode_cursor_datagram(&bytes) {
-                    cursor_store.apply_state(state);
-                } else {
-                    warn!("received invalid cursor datagram ({} bytes)", bytes.len());
-                }
-            }
-            Err(err) => {
-                info!("cursor datagram loop stopped: {err}");
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn read_control_msg(recv: &mut quinn::RecvStream) -> Result<ControlMsg> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await.context("read length")?;
@@ -439,8 +484,11 @@ fn make_client_endpoint() -> Result<Endpoint> {
             .context("build QUIC client config")?,
     ));
     let mut transport_config = TransportConfig::default();
-    transport_config.datagram_receive_buffer_size(Some(64 * 1024));
-    transport_config.datagram_send_buffer_size(64 * 1024);
+    // Receive buffer large enough to queue a full keyframe burst while the
+    // async dispatch loop is busy (~8 MB covers many 1080p IDR fragments).
+    transport_config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    // Send buffer for client → server datagrams (cursor etc.).
+    transport_config.datagram_send_buffer_size(256 * 1024);
     client_config.transport_config(Arc::new(transport_config));
 
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?).context("create client endpoint")?;

@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 // Video transport
 // ---------------------------------------------------------------------------
 
-/// Header prepended to every video datagram fragment. 18 bytes, fixed layout.
+/// Header prepended to every video datagram fragment. 24 bytes, fixed layout.
 ///
 /// A single compressed frame may be split into multiple fragments because QUIC
 /// datagram payloads are bounded by the path MTU. Slices allow the decoder to
 /// start on the first slice while the second is still in flight (NVENC
-/// sliceMode=3).
+/// sliceMode=3). Each slice is additionally protected with XOR parity FEC over
+/// fixed-size groups of data fragments so the receiver can recover one lost
+/// fragment per group without waiting for an IDR.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[repr(C)]
 pub struct VideoPacketHeader {
@@ -23,18 +25,23 @@ pub struct VideoPacketHeader {
     pub frame_seq: u32,
     /// Microseconds since Unix epoch at encode-complete time.
     pub timestamp_us: u64,
-    /// Which slice of the frame this fragment belongs to (0-indexed).
+    /// Which slice of the frame this packet belongs to (0-indexed).
     pub slice_idx: u8,
-    /// Bitfield of frame flags.
+    /// Bitfield of frame and packet flags.
     pub flags: VideoFlags,
-    /// Fragment index within the current slice (0-indexed).
+    /// Data-fragment index within the current slice (0-indexed) for normal
+    /// packets, or the FEC group index for parity packets.
     pub frag_idx: u16,
-    /// Total number of fragments in the current slice.
+    /// Total number of data fragments in the current slice.
     pub frag_total: u16,
+    /// Total compressed payload bytes in the current slice.
+    pub slice_len: u32,
+    /// Payload size used for all non-final data fragments in the slice.
+    pub frag_payload_size: u16,
 }
 
 impl VideoPacketHeader {
-    pub const SIZE: usize = 18; // serialized as fixed little-endian bytes
+    pub const SIZE: usize = 24; // serialized as fixed little-endian bytes
 
     pub fn is_keyframe(&self) -> bool {
         self.flags.contains(VideoFlags::KEY_FRAME)
@@ -43,6 +50,10 @@ impl VideoPacketHeader {
     pub fn is_last_slice(&self) -> bool {
         self.flags.contains(VideoFlags::LAST_SLICE)
     }
+
+    pub fn is_fec_parity(&self) -> bool {
+        self.flags.contains(VideoFlags::FEC_PARITY)
+    }
 }
 
 bitflags::bitflags! {
@@ -50,10 +61,19 @@ bitflags::bitflags! {
     pub struct VideoFlags: u8 {
         /// This frame is an IDR (keyframe).
         const KEY_FRAME  = 0b0000_0001;
-        /// This is the final slice in the frame.
+        /// This packet belongs to the final slice in the frame.
         const LAST_SLICE = 0b0000_0010;
+        /// This packet carries XOR parity bytes rather than encoded video data.
+        const FEC_PARITY = 0b0000_0100;
     }
 }
+
+/// Number of data fragments protected by one XOR parity datagram.
+///
+/// Each parity packet can recover any single lost data fragment within its
+/// group. A group size of 4 keeps overhead at 25% while still repairing the
+/// most common isolated datagram loss pattern.
+pub const VIDEO_FEC_DATA_SHARDS: usize = 4;
 
 /// How the server delivers video frames to the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +145,16 @@ bitflags::bitflags! {
 pub struct SessionRequest {
     /// Protocol version — must match server.
     pub version: u32,
+    /// Stable logical client session identifier reused across reconnects.
+    pub client_session_id: String,
+    /// Whether the server may adapt bitrate/FPS during the session.
+    pub adaptive_streaming: bool,
     pub max_fps: u8,
+    pub min_fps: u8,
+    /// Zero means "use the server default floor".
+    pub min_bitrate_bps: u32,
+    /// Zero means "use the server preset ceiling".
+    pub max_bitrate_bps: u32,
     pub width: u32,
     pub height: u32,
     /// Ordered preference list; server picks the first it supports.
@@ -189,6 +218,8 @@ pub enum ControlMsg {
     SessionRequest(SessionRequest),
     SessionAccept(SessionAccept),
     SessionReject(SessionReject),
+    /// Client-side rolling telemetry used by the server adaptation loop.
+    ClientTelemetry(ClientTelemetry),
     /// Client requests an immediate IDR keyframe (e.g. after packet loss).
     RequestIdr,
     /// Heartbeat with server-side telemetry.
@@ -202,6 +233,25 @@ pub enum ControlMsg {
     Goodbye,
 }
 
+/// Per-window telemetry stamped by the client.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientTelemetry {
+    /// Number of unrecoverable frames dropped by the reassembler.
+    pub unrecoverable_frames: u32,
+    /// Number of frames that required FEC repair before decode.
+    pub recovered_frames: u32,
+    /// Number of individual fragments recovered by FEC.
+    pub recovered_fragments: u32,
+    /// Number of frames presented by the renderer.
+    pub presented_frames: u32,
+    /// Number of frames dropped by the renderer while keeping latency low.
+    pub render_dropped_frames: u32,
+    /// Average time from datagram reassembly to decode submission.
+    pub avg_decode_queue_us: u32,
+    /// Average time from decode completion to render submission.
+    pub avg_render_queue_us: u32,
+}
+
 /// Per-heartbeat telemetry stamped by the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTelemetry {
@@ -213,6 +263,10 @@ pub struct ServerTelemetry {
     pub avg_encode_us: u32,
     /// Average time spent packetising and sending the frame.
     pub avg_send_us: u32,
+    /// Average time spent waiting for QUIC datagram send buffer space.
+    pub avg_send_wait_us: u32,
+    /// Maximum time spent waiting for QUIC datagram send buffer space.
+    pub max_send_wait_us: u32,
     /// Average total pipeline time per frame.
     pub avg_pipeline_us: u32,
     /// Current send queue depth in frames.
@@ -221,6 +275,18 @@ pub struct ServerTelemetry {
     pub idr_count: u8,
     /// Number of frames processed in the last telemetry window.
     pub frame_count: u32,
+    /// Current encoder bitrate target in bits per second.
+    pub encoder_bitrate_bps: u32,
+    /// Current target framerate for capture/encode pacing.
+    pub target_fps: u8,
+    /// Number of video datagrams successfully sent in the last telemetry window.
+    pub video_datagrams_sent: u32,
+    /// Number of video datagrams dropped after a failed send in the last telemetry window.
+    pub video_datagrams_dropped: u32,
+    /// Effective maximum QUIC datagram size used for the current path.
+    pub max_datagram_size: u32,
+    /// Effective encoded payload bytes per video fragment.
+    pub fragment_payload_bytes: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,12 +316,12 @@ pub struct RemoteCursorState {
 }
 
 /// Protocol version. Both sides must agree or the server rejects the session.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 7;
 
-/// Parse a `VideoPacketHeader` from the first 18 bytes of a datagram payload.
+/// Parse a `VideoPacketHeader` from the first 24 bytes of a datagram payload.
 /// Returns `(header, remaining_payload)` on success.
 pub fn parse_video_header(buf: &[u8]) -> Option<(VideoPacketHeader, &[u8])> {
-    if buf.len() < 18 {
+    if buf.len() < VideoPacketHeader::SIZE {
         return None;
     }
     let frame_seq = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -264,6 +330,8 @@ pub fn parse_video_header(buf: &[u8]) -> Option<(VideoPacketHeader, &[u8])> {
     let flags = VideoFlags::from_bits_truncate(buf[13]);
     let frag_idx = u16::from_le_bytes(buf[14..16].try_into().unwrap());
     let frag_total = u16::from_le_bytes(buf[16..18].try_into().unwrap());
+    let slice_len = u32::from_le_bytes(buf[18..22].try_into().unwrap());
+    let frag_payload_size = u16::from_le_bytes(buf[22..24].try_into().unwrap());
     Some((
         VideoPacketHeader {
             frame_seq,
@@ -272,14 +340,16 @@ pub fn parse_video_header(buf: &[u8]) -> Option<(VideoPacketHeader, &[u8])> {
             flags,
             frag_idx,
             frag_total,
+            slice_len,
+            frag_payload_size,
         },
-        &buf[18..],
+        &buf[VideoPacketHeader::SIZE..],
     ))
 }
 
 /// Conservative maximum video payload bytes per QUIC datagram on internet paths.
 /// Accounts for QUIC short-header overhead (~28 bytes), the 1-byte datagram
-/// type tag, and the 18-byte video fragment header, leaving room for the
+/// type tag, and the 24-byte video fragment header, leaving room for the
 /// encoded video data. The actual limit is negotiated at runtime via
 /// `Connection::max_datagram_size()`; this constant is the safe fallback.
 pub const MTU_WAN: usize = 1200;

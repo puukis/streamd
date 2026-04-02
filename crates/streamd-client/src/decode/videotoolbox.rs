@@ -3,7 +3,7 @@
 #[cfg(not(target_os = "macos"))]
 use anyhow::bail;
 use anyhow::Result;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -50,16 +50,19 @@ use anyhow::Context;
 static FIRST_DECODED_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
 
 impl VideoToolboxDecoder {
-    pub fn start(frame_rx: Receiver<DecodedFrame>) -> Result<(Self, Receiver<RenderFrame>)> {
+    pub fn start_with_output(
+        frame_rx: Receiver<DecodedFrame>,
+        render_tx: Sender<RenderFrame>,
+        callback_render_rx: Receiver<RenderFrame>,
+    ) -> Result<Self> {
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = frame_rx;
+            let _ = (frame_rx, render_tx, callback_render_rx);
             bail!("streamd-client video decode is only supported on macOS");
         }
 
         #[cfg(target_os = "macos")]
         {
-            use crossbeam_channel::Sender;
             use std::time::{Duration, Instant};
             use tracing::{debug, info, warn};
 
@@ -76,6 +79,11 @@ impl VideoToolboxDecoder {
                 submitted_frames: u32,
                 total_queue_us: u64,
                 window_started_at: Instant,
+            }
+
+            struct LatestRenderQueue {
+                tx: Sender<RenderFrame>,
+                rx: Receiver<RenderFrame>,
             }
 
             impl DecodeSubmitStats {
@@ -132,7 +140,7 @@ impl VideoToolboxDecoder {
                 let Some(metadata) = metadata else {
                     return;
                 };
-                let render_tx = unsafe { &*(refcon as *const Sender<RenderFrame>) };
+                let render_queue = unsafe { &*(refcon as *const LatestRenderQueue) };
 
                 match retain_pixel_buffer(
                     image,
@@ -141,8 +149,12 @@ impl VideoToolboxDecoder {
                     metadata.received_at_us,
                     metadata.decode_submitted_at_us,
                 ) {
-                    Ok(frame) => match render_tx.try_send(frame) {
-                        Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                    Ok(frame) => match render_queue.tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(crossbeam_channel::TrySendError::Full(frame)) => {
+                            let _ = render_queue.rx.try_recv();
+                            let _ = render_queue.tx.try_send(frame);
+                        }
                         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
                     },
                     Err(err) => warn!("retain decoded frame failed: {err:#}"),
@@ -151,7 +163,6 @@ impl VideoToolboxDecoder {
 
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
-            let (render_tx, render_rx) = crossbeam_channel::bounded(4);
 
             let thread = std::thread::Builder::new()
                 .name("streamd-decode".into())
@@ -163,8 +174,11 @@ impl VideoToolboxDecoder {
                     let mut session: VTDecompressionSessionRef = std::ptr::null_mut();
                     let mut decode_stats = DecodeSubmitStats::new();
 
-                    let callback_tx = Box::new(render_tx.clone());
-                    let callback_tx_ptr = Box::into_raw(callback_tx) as *mut std::ffi::c_void;
+                    let callback_queue = Box::new(LatestRenderQueue {
+                        tx: render_tx.clone(),
+                        rx: callback_render_rx,
+                    });
+                    let callback_tx_ptr = Box::into_raw(callback_queue) as *mut std::ffi::c_void;
 
                     info!("VideoToolbox decode thread started");
 
@@ -292,22 +306,17 @@ impl VideoToolboxDecoder {
 
                     unsafe {
                         destroy_session(&mut session, &mut format_desc);
-                        drop(Box::from_raw(
-                            callback_tx_ptr as *mut crossbeam_channel::Sender<RenderFrame>,
-                        ));
+                        drop(Box::from_raw(callback_tx_ptr as *mut LatestRenderQueue));
                     }
 
                     info!("VideoToolbox decode thread exited");
                 })
                 .context("spawn decode thread")?;
 
-            Ok((
-                Self {
-                    stop,
-                    thread: Some(thread),
-                },
-                render_rx,
-            ))
+            Ok(Self {
+                stop,
+                thread: Some(thread),
+            })
         }
     }
 }

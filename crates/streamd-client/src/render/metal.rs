@@ -5,7 +5,9 @@ use anyhow::{bail, Result};
 use crossbeam_channel::Receiver;
 use std::sync::{atomic::AtomicBool, Arc};
 
-use crate::{cursor::RemoteCursorStore, decode::videotoolbox::RenderFrame};
+use crate::{
+    cursor::RemoteCursorStore, decode::videotoolbox::RenderFrame, telemetry::SharedClientTelemetry,
+};
 
 #[cfg(target_os = "macos")]
 use anyhow::{anyhow, Context};
@@ -48,6 +50,7 @@ impl VideoRenderer {
         initial_height: u32,
         cursor_store: Arc<RemoteCursorStore>,
         shutdown: Arc<AtomicBool>,
+        telemetry: SharedClientTelemetry,
     ) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
@@ -57,6 +60,7 @@ impl VideoRenderer {
                 initial_height,
                 cursor_store,
                 shutdown,
+                telemetry,
             )
         }
         #[cfg(not(target_os = "macos"))]
@@ -67,6 +71,7 @@ impl VideoRenderer {
                 initial_height,
                 cursor_store,
                 shutdown,
+                telemetry,
             );
             bail!("streamd-client video presentation is only supported on macOS");
         }
@@ -323,6 +328,7 @@ fn render_loop_macos(
     initial_height: u32,
     cursor_store: Arc<RemoteCursorStore>,
     shutdown: Arc<AtomicBool>,
+    telemetry: SharedClientTelemetry,
 ) -> Result<()> {
     use cocoa::{
         appkit::{
@@ -333,7 +339,7 @@ fn render_loop_macos(
         foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString},
     };
     use objc::rc::autoreleasepool;
-    use std::{thread, time::Duration};
+    use std::time::Duration;
 
     unsafe {
         info!("macOS renderer startup: creating autorelease pool");
@@ -389,6 +395,7 @@ fn render_loop_macos(
 
         let mut current_size = (initial_width, initial_height);
         let mut first_frame_logged = false;
+        let mut queued_frame = None;
         let mut render_stats = RenderStats::new();
 
         loop {
@@ -399,16 +406,24 @@ fn render_loop_macos(
                 break;
             }
 
-            let mut latest_frame = None;
             let mut disconnected = false;
             let mut dropped_frames = 0u32;
+
+            let frame = match queued_frame.take() {
+                Some(frame) => frame,
+                None => match render_rx.recv_timeout(Duration::from_millis(8)) {
+                    Ok(frame) => frame,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                },
+            };
+
             loop {
                 match render_rx.try_recv() {
                     Ok(frame) => {
-                        if latest_frame.is_some() {
+                        if queued_frame.replace(frame).is_some() {
                             dropped_frames = dropped_frames.saturating_add(1);
                         }
-                        latest_frame = Some(frame);
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -418,50 +433,55 @@ fn render_loop_macos(
                 }
             }
 
-            if let Some(frame) = latest_frame {
-                if !first_frame_logged {
-                    info!(
-                        "Metal renderer received first frame seq={} {}x{}",
-                        frame.frame_seq, frame.width, frame.height
-                    );
-                    first_frame_logged = true;
-                }
-                if current_size != (frame.width, frame.height) {
-                    current_size = (frame.width, frame.height);
-                    resize_window_and_layer(
-                        window,
-                        content_view,
-                        renderer.layer.as_ref(),
-                        frame.width,
-                        frame.height,
-                    );
-                }
-
-                autoreleasepool(|| {
-                    let present_started_at_us = now_local_us();
-                    if let Err(err) = present_frame(&mut renderer, &frame, &cursor_store) {
-                        warn!("present frame {} failed: {err:#}", frame.frame_seq);
-                    } else {
-                        let present_finished_at_us = now_local_us();
-                        let present_cpu_us = duration_to_u32_us(std::time::Duration::from_micros(
-                            present_finished_at_us.saturating_sub(present_started_at_us),
-                        ));
-                        let render_queue_us =
-                            present_started_at_us.saturating_sub(frame.decoded_at_us) as u32;
-                        render_stats.record_presented(
-                            &frame,
-                            render_queue_us,
-                            present_cpu_us,
-                            dropped_frames,
-                        );
-                    }
-                });
-                render_stats.maybe_log();
-            } else if disconnected {
-                break;
+            if !first_frame_logged {
+                info!(
+                    "Metal renderer received first frame seq={} {}x{}",
+                    frame.frame_seq, frame.width, frame.height
+                );
+                first_frame_logged = true;
+            }
+            if current_size != (frame.width, frame.height) {
+                current_size = (frame.width, frame.height);
+                resize_window_and_layer(
+                    window,
+                    content_view,
+                    renderer.layer.as_ref(),
+                    frame.width,
+                    frame.height,
+                );
             }
 
-            thread::sleep(Duration::from_millis(4));
+            autoreleasepool(|| {
+                let present_started_at_us = now_local_us();
+                if let Err(err) = present_frame(&mut renderer, &frame, &cursor_store) {
+                    warn!("present frame {} failed: {err:#}", frame.frame_seq);
+                } else {
+                    let present_finished_at_us = now_local_us();
+                    let present_cpu_us = duration_to_u32_us(std::time::Duration::from_micros(
+                        present_finished_at_us.saturating_sub(present_started_at_us),
+                    ));
+                    let render_queue_us =
+                        present_started_at_us.saturating_sub(frame.decoded_at_us) as u32;
+                    telemetry.record_render(
+                        frame
+                            .decode_submitted_at_us
+                            .saturating_sub(frame.received_at_us) as u32,
+                        render_queue_us,
+                        dropped_frames,
+                    );
+                    render_stats.record_presented(
+                        &frame,
+                        render_queue_us,
+                        present_cpu_us,
+                        dropped_frames,
+                    );
+                }
+            });
+            render_stats.maybe_log();
+
+            if disconnected && queued_frame.is_none() {
+                break;
+            }
         }
 
         window.close();
@@ -486,7 +506,11 @@ impl RendererState {
         let layer = MetalLayer::new();
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        layer.set_display_sync_enabled(true);
         layer.set_presents_with_transaction(false);
+        // Keep the drawable queue shallow so presentation cannot drift multiple
+        // frames behind the newest decoded image.
+        layer.set_maximum_drawable_count(2);
         layer.set_opaque(true);
         layer.set_framebuffer_only(true);
         layer.remove_all_animations();

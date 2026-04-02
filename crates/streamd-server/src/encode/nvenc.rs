@@ -86,8 +86,19 @@ pub struct NvencConfig {
 impl NvencConfig {
     /// Recommended LAN configuration for lowest latency.
     pub fn lan_h264(width: u32, height: u32, fps: u8) -> Self {
-        // At 60fps, 50 Mbps gives excellent quality; at 120fps, push to 80 Mbps.
-        let bitrate_bps = if fps >= 100 { 80_000_000 } else { 50_000_000 };
+        // Scale bitrate with the actual pixel rate instead of using one fixed
+        // 50 Mbps target for every desktop size. The old fixed setting was
+        // acceptable at 1080p60 but too aggressive for higher-resolution
+        // desktop content, which can show visible whole-frame quality pumping
+        // on even small motion changes.
+        let pixels_per_second = u64::from(width) * u64::from(height) * u64::from(fps.max(1));
+        let bitrate_bps = match pixels_per_second {
+            n if n <= 1920_u64 * 1080 * 60 => 50_000_000,
+            n if n <= 2560_u64 * 1440 * 60 => 80_000_000,
+            n if n <= 3840_u64 * 2160 * 60 => 140_000_000,
+            n if n <= 3840_u64 * 2160 * 120 => 220_000_000,
+            _ => 260_000_000,
+        };
         Self {
             width,
             height,
@@ -574,6 +585,7 @@ mod real {
     const NV_ENC_CONFIG_VER: u32 = sv(9) | (1u32 << 31);
     const NV_ENC_PRESET_CONFIG_VER: u32 = sv(5) | (1u32 << 31);
     const NV_ENC_INITIALIZE_PARAMS_VER: u32 = sv(7) | (1u32 << 31);
+    const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = sv(2) | (1u32 << 31);
     const NV_ENC_CREATE_INPUT_BUFFER_VER: u32 = sv(2);
     const NV_ENC_CREATE_BITSTREAM_BUFFER_VER: u32 = sv(1);
     #[allow(dead_code)]
@@ -726,6 +738,119 @@ mod real {
             let device_ctx =
                 CudaContext::create_default().context("create CUDA context for NVENC")?;
             Self::with_cuda_context(config, device_ctx)
+        }
+
+        pub fn reconfigure(&mut self, config: NvencConfig) -> Result<()> {
+            if config.width != self.config.width || config.height != self.config.height {
+                bail!(
+                    "NVENC reconfigure only supports bitrate/FPS changes, not resolution changes"
+                );
+            }
+            if config.h264 != self.config.h264 {
+                bail!("NVENC reconfigure only supports bitrate/FPS changes, not codec changes");
+            }
+
+            let codec_guid = if config.h264 {
+                NV_ENC_CODEC_H264_GUID_VALUE
+            } else {
+                NV_ENC_CODEC_HEVC_GUID_VALUE
+            };
+            let preset_p1_guid = NV_ENC_PRESET_P1_GUID_VALUE;
+
+            let mut enc_config = NV_ENC_CONFIG {
+                version: NV_ENC_CONFIG_VER,
+                ..Default::default()
+            };
+            let mut preset_cfg = NV_ENC_PRESET_CONFIG {
+                version: NV_ENC_PRESET_CONFIG_VER,
+                presetCfg: enc_config,
+                ..Default::default()
+            };
+            let status = unsafe {
+                (self.api.nvEncGetEncodePresetConfigEx.unwrap())(
+                    self.encoder,
+                    codec_guid,
+                    preset_p1_guid,
+                    NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                    &mut preset_cfg,
+                )
+            };
+            if status != NV_ENC_SUCCESS {
+                bail!("nvEncGetEncodePresetConfigEx failed during reconfigure: {status:?}");
+            }
+
+            enc_config = preset_cfg.presetCfg;
+            enc_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+            enc_config.rcParams.averageBitRate = config.bitrate_bps;
+            enc_config.rcParams.maxBitRate = config.bitrate_bps * 6 / 5;
+            enc_config.rcParams.vbvBufferSize = config.vbv_size();
+            enc_config.rcParams.vbvInitialDelay = config.vbv_size();
+            enc_config.rcParams.set_enableMinQP(1);
+            enc_config.rcParams.minQP.qpInterP = 20;
+            enc_config.rcParams.minQP.qpInterB = 20;
+            enc_config.rcParams.minQP.qpIntra = 20;
+
+            unsafe {
+                if config.h264 {
+                    enc_config.encodeCodecConfig.h264Config.sliceMode = 3;
+                    enc_config.encodeCodecConfig.h264Config.sliceModeData = 2;
+                    enc_config.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+                    enc_config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1);
+                    enc_config.encodeCodecConfig.h264Config.set_outputAUD(0);
+                    enc_config.encodeCodecConfig.h264Config.set_disableSPSPPS(0);
+                } else {
+                    enc_config.encodeCodecConfig.hevcConfig.sliceMode = 3;
+                    enc_config.encodeCodecConfig.hevcConfig.sliceModeData = 2;
+                    enc_config.encodeCodecConfig.hevcConfig.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+                    enc_config.encodeCodecConfig.hevcConfig.set_repeatSPSPPS(1);
+                }
+            }
+
+            enc_config.gopLength = NVENC_INFINITE_GOPLENGTH;
+            enc_config.frameIntervalP = 1;
+
+            let init_params = NV_ENC_INITIALIZE_PARAMS {
+                version: NV_ENC_INITIALIZE_PARAMS_VER,
+                encodeGUID: codec_guid,
+                presetGUID: preset_p1_guid,
+                tuningInfo: NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                encodeWidth: config.width,
+                encodeHeight: config.height,
+                darWidth: config.width,
+                darHeight: config.height,
+                frameRateNum: config.fps as u32,
+                frameRateDen: 1,
+                encodeConfig: &mut enc_config,
+                enableEncodeAsync: 0,
+                enablePTD: 1,
+                ..Default::default()
+            };
+            let mut reconfigure_params = NV_ENC_RECONFIGURE_PARAMS {
+                version: NV_ENC_RECONFIGURE_PARAMS_VER,
+                reserved: 0,
+                reInitEncodeParams: init_params,
+                _bitfield_align_1: [],
+                _bitfield_1: NV_ENC_RECONFIGURE_PARAMS::new_bitfield_1(0, 1, 0),
+                reserved2: 0,
+            };
+
+            let status = unsafe {
+                (self.api.nvEncReconfigureEncoder.unwrap())(self.encoder, &mut reconfigure_params)
+            };
+            if status != NV_ENC_SUCCESS {
+                bail!("nvEncReconfigureEncoder failed: {status:?}");
+            }
+
+            self.config = config;
+            info!(
+                "NVENC encoder reconfigured: {} {}x{}@{}fps {:.0}Mbps",
+                if self.config.h264 { "H.264" } else { "HEVC" },
+                self.config.width,
+                self.config.height,
+                self.config.fps,
+                self.config.bitrate_bps as f64 / 1e6,
+            );
+            Ok(())
         }
 
         #[cfg(target_os = "windows")]
@@ -1615,6 +1740,10 @@ impl NvencEncoder {
              The repo normally vendors it under third_party/nv-codec-headers.\n\
              Override with NVENC_HEADER_PATH or NVENC_INCLUDE_DIR and rebuild."
         )
+    }
+
+    pub fn reconfigure(&mut self, _config: NvencConfig) -> Result<()> {
+        anyhow::bail!("NVENC not available")
     }
 
     #[cfg(target_os = "windows")]

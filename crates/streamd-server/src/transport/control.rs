@@ -5,8 +5,12 @@ use crossbeam_channel::TrySendError;
 use quinn::{Endpoint, RecvStream, SendDatagramError, SendStream, ServerConfig, TransportConfig};
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use streamd_proto::{
     control::{decode_msg, encode_cursor_datagram, encode_msg},
     input::decode_packet,
@@ -17,7 +21,89 @@ use streamd_proto::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{capture::CursorEvent, pipeline::PipelineHandle};
+use crate::{
+    capture::CursorEvent,
+    pipeline::{AdaptiveStreamConfig, PipelineHandle},
+};
+
+const QUIC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const QUIC_MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const APP_ERR_SESSION_REPLACED: u32 = 0x100;
+
+#[derive(Clone)]
+struct RegisteredSession {
+    token: u64,
+    conn: quinn::Connection,
+    stop_flag: Arc<AtomicBool>,
+}
+
+struct SessionRegistration {
+    client_session_id: String,
+    token: u64,
+}
+
+impl Drop for SessionRegistration {
+    fn drop(&mut self) {
+        unregister_session(&self.client_session_id, self.token);
+    }
+}
+
+static SESSION_REGISTRY: OnceLock<Mutex<HashMap<String, RegisteredSession>>> = OnceLock::new();
+static NEXT_SESSION_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn session_registry() -> &'static Mutex<HashMap<String, RegisteredSession>> {
+    SESSION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_session(
+    client_session_id: &str,
+    conn: &quinn::Connection,
+    stop_flag: Arc<AtomicBool>,
+) -> u64 {
+    let token = NEXT_SESSION_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let replaced = {
+        let mut registry = session_registry()
+            .lock()
+            .expect("session registry mutex poisoned");
+        registry.insert(
+            client_session_id.to_owned(),
+            RegisteredSession {
+                token,
+                conn: conn.clone(),
+                stop_flag,
+            },
+        )
+    };
+
+    if let Some(old) = replaced {
+        old.stop_flag.store(true, Ordering::Relaxed);
+        old.conn
+            .close(APP_ERR_SESSION_REPLACED.into(), b"replaced by reconnect");
+    }
+
+    token
+}
+
+fn unregister_session(client_session_id: &str, token: u64) {
+    let mut registry = session_registry()
+        .lock()
+        .expect("session registry mutex poisoned");
+    if registry
+        .get(client_session_id)
+        .is_some_and(|session| session.token == token)
+    {
+        registry.remove(client_session_id);
+    }
+}
+
+fn protocol_version_reject(version: u32) -> Option<String> {
+    (version != PROTOCOL_VERSION).then(|| {
+        format!(
+            "version mismatch: client={} server={PROTOCOL_VERSION}",
+            version
+        )
+    })
+}
 
 pub async fn run_server(bind_addr: SocketAddr) -> Result<()> {
     let endpoint = make_server_endpoint(bind_addr)?;
@@ -78,23 +164,41 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
         }
     };
 
-    if req.version != PROTOCOL_VERSION {
+    if let Some(reason) = protocol_version_reject(req.version) {
         send_msg(
             &mut send,
-            ControlMsg::SessionReject(SessionReject {
-                reason: format!(
-                    "version mismatch: client={} server={PROTOCOL_VERSION}",
-                    req.version
-                ),
-            }),
+            ControlMsg::SessionReject(SessionReject { reason }),
         )
         .await?;
         bail!("version mismatch");
+    }
+    let client_session_id = req.client_session_id.trim().to_owned();
+    if client_session_id.is_empty() {
+        send_msg(
+            &mut send,
+            ControlMsg::SessionReject(SessionReject {
+                reason: "client_session_id must not be empty".into(),
+            }),
+        )
+        .await?;
+        bail!("empty client_session_id");
     }
 
     // Negotiate codec
     let codec = negotiate_codec(&req);
     let fps = req.max_fps.clamp(1, 120);
+    let adaptive_config = AdaptiveStreamConfig {
+        enabled: req.adaptive_streaming,
+        min_fps: if req.min_fps > 0 {
+            req.min_fps.clamp(1, fps)
+        } else if fps >= 30 {
+            30
+        } else {
+            fps
+        },
+        min_bitrate_bps: req.min_bitrate_bps,
+        max_bitrate_bps: req.max_bitrate_bps,
+    };
     let displays = match crate::capture::list_displays().context("enumerate displays for session") {
         Ok(displays) => displays,
         Err(err) => {
@@ -143,8 +247,10 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
         selected_display: selected_display.clone(),
     };
     info!(
-        "session accepted: {codec:?} {width}x{height}@{fps}fps display={} ({}) → QUIC datagrams",
-        selected_display.name, selected_display.id
+        "session accepted: {codec:?} {width}x{height}@{fps}fps display={} ({}) adaptive={} → QUIC datagrams",
+        selected_display.name,
+        selected_display.id,
+        if adaptive_config.enabled { "on" } else { "off" }
     );
     send_msg(&mut send, ControlMsg::SessionAccept(accept)).await?;
 
@@ -177,8 +283,13 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
         width,
         height,
         Some(selected_display.id.clone()),
+        adaptive_config,
         conn.clone(),
     )?;
+    let _session_registration = SessionRegistration {
+        client_session_id: client_session_id.clone(),
+        token: register_session(&client_session_id, &conn, pipeline.stop_flag()),
+    };
     let mut telemetry_rx = pipeline.take_telemetry_rx();
     let mut cursor_rx = pipeline.take_cursor_rx();
 
@@ -192,6 +303,9 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
                     Ok(ControlMsg::RequestIdr) => {
                         info!("IDR requested by client");
                         pipeline.request_idr();
+                    }
+                    Ok(ControlMsg::ClientTelemetry(sample)) => {
+                        pipeline.update_client_telemetry(sample);
                     }
                     Ok(ControlMsg::Goodbye) | Err(_) => {
                         info!("client {remote} disconnected");
@@ -340,8 +454,31 @@ fn make_server_endpoint(bind_addr: SocketAddr) -> Result<Endpoint> {
     transport_config.datagram_send_buffer_size(4 * 1024 * 1024);
     // Receive buffer for incoming cursor or future client datagrams.
     transport_config.datagram_receive_buffer_size(Some(256 * 1024));
+    // Keep sessions alive while the desktop is static and no input/events are
+    // flowing. A streaming session should not depend on local mouse movement
+    // to remain connected.
+    transport_config.keep_alive_interval(Some(QUIC_KEEPALIVE_INTERVAL));
+    transport_config.max_idle_timeout(Some(
+        QUIC_MAX_IDLE_TIMEOUT
+            .try_into()
+            .context("convert server QUIC idle timeout")?,
+    ));
     server_config.transport_config(Arc::new(transport_config));
 
     let endpoint = Endpoint::server(server_config, bind_addr).context("create QUIC endpoint")?;
     Ok(endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protocol_version_reject;
+    use streamd_proto::packets::PROTOCOL_VERSION;
+
+    #[test]
+    fn rejects_previous_protocol_versions() {
+        let previous = PROTOCOL_VERSION.saturating_sub(1);
+        let reason = protocol_version_reject(previous).expect("older version should be rejected");
+        assert!(reason.contains(&format!("client={previous}")));
+        assert!(protocol_version_reject(PROTOCOL_VERSION).is_none());
+    }
 }

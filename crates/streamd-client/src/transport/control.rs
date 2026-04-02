@@ -22,11 +22,12 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use streamd_proto::{
     control::{
-        decode_cursor_datagram, decode_msg, encode_msg, DATAGRAM_TAG_CURSOR, DATAGRAM_TAG_VIDEO,
+        decode_cursor_datagram, decode_msg, encode_input_datagram, encode_msg, DATAGRAM_TAG_CURSOR,
+        DATAGRAM_TAG_VIDEO,
     },
     input::encode_packet,
     packets::{
-        Codec, ControlMsg, DisplayInfo, InputPacket, SessionAccept, SessionRequest,
+        Codec, ControlMsg, DisplayInfo, InputEvent, InputPacket, SessionAccept, SessionRequest,
         PROTOCOL_VERSION,
     },
 };
@@ -451,8 +452,15 @@ async fn connect_active_connection(
     let input_capture = InputCapture::start(input_tx)?;
     let input_runtime = tokio::runtime::Handle::current();
     let input_shutdown = connection_shutdown.clone();
+    let input_conn = conn.clone();
     let input_task = tokio::task::spawn_blocking(move || {
-        forward_input_loop(input_rx, input_stream, input_runtime, input_shutdown)
+        forward_input_loop(
+            input_rx,
+            input_stream,
+            input_conn,
+            input_runtime,
+            input_shutdown,
+        )
     });
 
     let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(8);
@@ -784,17 +792,30 @@ async fn send_msg(send: &mut quinn::SendStream, msg: ControlMsg) -> Result<()> {
 fn forward_input_loop(
     input_rx: Receiver<InputPacket>,
     mut input_stream: quinn::SendStream,
+    conn: quinn::Connection,
     runtime: tokio::runtime::Handle,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     loop {
         match input_rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(packet) => {
-                let bytes = encode_packet(&packet);
-                runtime
-                    .block_on(input_stream.write_all(&bytes))
-                    .context("write input packet")?;
-            }
+            Ok(packet) => match &packet.event {
+                InputEvent::MouseMove { .. } => {
+                    // Mouse moves are idempotent: only the latest delta matters.
+                    // Send as an unreliable datagram to avoid head-of-line blocking
+                    // on the reliable input stream stalling subsequent events.
+                    if let Err(err) = conn.send_datagram(encode_input_datagram(&packet)) {
+                        warn!("mouse move datagram dropped: {err}");
+                    }
+                }
+                _ => {
+                    // Key presses, mouse buttons, and scroll events require
+                    // reliable ordered delivery; keep them on the stream.
+                    let bytes = encode_packet(&packet);
+                    runtime
+                        .block_on(input_stream.write_all(&bytes))
+                        .context("write input packet")?;
+                }
+            },
             Err(RecvTimeoutError::Timeout) if shutdown.load(Ordering::Relaxed) => break,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,

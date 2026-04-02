@@ -12,7 +12,9 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use streamd_proto::{
-    control::{decode_msg, encode_cursor_datagram, encode_msg},
+    control::{
+        decode_input_datagram, decode_msg, encode_cursor_datagram, encode_msg, DATAGRAM_TAG_INPUT,
+    },
     input::decode_packet,
     packets::{
         Codec, ControlMsg, DisplayInfo, InputPacket, SessionAccept, SessionReject, SessionRequest,
@@ -259,6 +261,9 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
     let _input_injector = crate::input::linux::LinuxInputInjector::start(input_rx)?;
     #[cfg(target_os = "windows")]
     let _input_injector = crate::input::windows::WindowsInputInjector::start(input_rx)?;
+    // Clone so the datagram dispatch arm in the control loop can also inject
+    // mouse-move packets without competing with the reliable stream task.
+    let datagram_input_tx = input_tx.clone();
     let input_conn = conn.clone();
     let input_task = tokio::spawn(async move {
         match input_conn.accept_uni().await {
@@ -295,7 +300,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
 
     let mut cursor_datagrams_supported = conn.max_datagram_size().is_some();
 
-    // Control loop: heartbeats + IDR requests
+    // Control loop: heartbeats + IDR requests + mouse-move datagrams
     loop {
         tokio::select! {
             msg = read_control_msg(&mut recv) => {
@@ -344,6 +349,37 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
                         }
                     }
                     None => break,
+                }
+            }
+            dgram = conn.read_datagram() => {
+                match dgram {
+                    Ok(bytes) => {
+                        match bytes.first() {
+                            Some(&DATAGRAM_TAG_INPUT) => {
+                                if let Some(packet) = decode_input_datagram(&bytes) {
+                                    match datagram_input_tx.try_send(packet) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Full(_)) => {
+                                            debug!("dropping mouse move datagram: input queue full");
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => break,
+                                    }
+                                } else {
+                                    warn!("received malformed input datagram ({} bytes)", bytes.len());
+                                }
+                            }
+                            Some(&tag) => {
+                                warn!("received datagram with unknown type tag {tag:#04x} from client — ignoring");
+                            }
+                            None => {
+                                warn!("received empty datagram from client — ignoring");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        info!("client {remote} disconnected (datagram channel): {err}");
+                        break;
+                    }
                 }
             }
         }

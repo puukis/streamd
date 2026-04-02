@@ -135,7 +135,7 @@ jobs:
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -188,7 +188,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
@@ -200,7 +200,7 @@ jobs:
         shell: bash
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -255,7 +255,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: artifacts

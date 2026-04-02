@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 The format follows Keep a Changelog and the project uses SemVer-style tags for GitHub releases.
+Detailed curated release bodies live under `docs/releases/`.
 
 ## Unreleased
 

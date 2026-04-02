@@ -40,6 +40,8 @@
 /coverage/
 *.profraw
 *.profdata
+__pycache__/
+*.pyc
 
 # Local release-planning scratch files
 /dist-manifest.json

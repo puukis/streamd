@@ -10,8 +10,8 @@
 # * uploads those artifacts to temporary workflow zip
 # * on success, uploads the artifacts to a GitHub Release
 #
-# Note that the GitHub Release will be created with a generated
-# title/body based on your changelogs.
+# Note that the GitHub Release body is published from the curated
+# markdown file checked in under docs/releases/<tag>.md.
 
 name: Release
 permissions:
@@ -249,75 +249,85 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
-    outputs:
-      val: ${{ steps.host.outputs.manifest }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install cached dist
-        uses: actions/download-artifact@v7
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
-      # Fetch artifacts from scratch-storage
-      - name: Fetch artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - id: host
-        shell: bash
-        run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
-          echo "artifacts uploaded and released successfully"
-          cat dist-manifest.json
-          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
-      - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v6
-        with:
-          # Overwrite the previous copy
-          name: artifacts-dist-manifest
-          path: dist-manifest.json
-      # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
           path: artifacts
           merge-multiple: true
-      - name: Cleanup
-        run: |
-          # Remove the granular manifests
-          rm -f artifacts/*-dist-manifest.json
-      - name: Create GitHub Release
+      - id: release-notes
+        name: Prepare curated release notes
+        shell: bash
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
+        run: |
+          export NOTES_PATH="docs/releases/${RELEASE_TAG}.md"
+          if [[ ! -f "$NOTES_PATH" ]]; then
+            echo "missing curated release notes at $NOTES_PATH" >&2
+            exit 1
+          fi
+
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          notes_path = Path(os.environ["NOTES_PATH"])
+          text = notes_path.read_text(encoding="utf-8").splitlines()
+          if not text or not text[0].startswith("# "):
+              raise SystemExit(f"{notes_path} must start with a '# ' heading")
+
+          title = text[0][2:].strip()
+          body_lines = text[1:]
+          if body_lines and body_lines[0] == "":
+              body_lines = body_lines[1:]
+          body = "\n".join(body_lines).rstrip() + "\n"
+
+          Path(os.environ["RUNNER_TEMP"]).joinpath("release-body.md").write_text(body, encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              print(f"title={title}", file=handle)
+              print(f"body={Path(os.environ['RUNNER_TEMP']).joinpath('release-body.md')}", file=handle)
+          PY
+      - name: Publish curated GitHub release
+        shell: bash
+        env:
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
+          RELEASE_TITLE: "${{ steps.release-notes.outputs.title }}"
+          RELEASE_BODY_PATH: "${{ steps.release-notes.outputs.body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          shopt -s nullglob
+          rm -f artifacts/dist-manifest.json artifacts/*-dist-manifest.json
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          mapfile -d '' release_files < <(find artifacts -maxdepth 1 -type f -print0 | sort -z)
+          if [[ ${#release_files[@]} -eq 0 ]]; then
+            echo "no release artifacts were downloaded" >&2
+            exit 1
+          fi
 
-  announce:
-    needs:
-      - plan
-      - host
-    # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
+          prerelease_flag=""
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          delete_manifest_assets() {
+            while IFS= read -r asset_name; do
+              [[ -z "$asset_name" ]] && continue
+              gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes >/dev/null 2>&1 || true
+            done < <(
+              gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null \
+                | grep 'dist-manifest\.json$' || true
+            )
+          }
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TITLE" --notes-file "$RELEASE_BODY_PATH"
+            delete_manifest_assets
+            gh release upload "$RELEASE_TAG" "${release_files[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $prerelease_flag --title "$RELEASE_TITLE" --notes-file "$RELEASE_BODY_PATH" "${release_files[@]}"
+          fi

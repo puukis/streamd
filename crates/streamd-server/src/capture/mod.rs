@@ -104,7 +104,7 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
 
     #[cfg(target_os = "windows")]
     {
-        return windows::list_displays();
+        windows::list_displays()
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

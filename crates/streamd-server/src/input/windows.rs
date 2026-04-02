@@ -110,7 +110,7 @@ fn inject_loop(packet_rx: Receiver<InputPacket>) {
                     continue;
                 };
                 let is_extended = scan > 0xFF;
-                let scan_code = (scan & 0xFF) as u16;
+                let scan_code = scan & 0xFF;
                 let mut flags = KEYEVENTF_SCANCODE;
                 if is_extended {
                     flags |= KEYEVENTF_EXTENDEDKEY;

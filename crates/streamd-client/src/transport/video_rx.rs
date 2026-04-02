@@ -181,7 +181,7 @@ impl VideoFrameReassembler {
 
         // Check if every slice of this frame is complete.
         let all_complete = if let Some(total) = entry.num_slices_expected {
-            (0..total).all(|i| entry.slices.get(&i).map_or(false, |s| s.is_complete()))
+            (0..total).all(|i| entry.slices.get(&i).is_some_and(|s| s.is_complete()))
         } else {
             false
         };

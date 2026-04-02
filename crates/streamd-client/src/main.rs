@@ -4,24 +4,46 @@ mod input;
 mod render;
 mod transport;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use clap::Parser;
 use tracing::info;
 
 #[cfg(target_os = "macos")]
 use std::net::SocketAddr;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "streamd-client",
+    version,
+    about = "Low-latency macOS QUIC remote desktop client for streamd."
+)]
+struct Args {
+    /// Address of the streamd server.
+    #[arg(value_name = "SERVER_ADDR", default_value = "127.0.0.1:9000")]
+    server_addr: std::net::SocketAddr,
+
+    /// Select a display by index, stable id, exact name, or exact description.
+    #[arg(long, value_name = "ID|INDEX|NAME")]
+    display: Option<String>,
+
+    /// List displays exported by the server and exit.
+    #[arg(long)]
+    list_displays: bool,
+
+    /// Tracing filter passed to tracing-subscriber.
+    #[arg(long, env = "RUST_LOG", default_value = "streamd_client=debug,info")]
+    log_filter: String,
+}
+
 fn main() -> Result<()> {
+    let args = Args::parse();
     install_rustls_crypto_provider()?;
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "streamd_client=debug,info".into()),
-        )
+        .with_env_filter(args.log_filter.clone())
         .init();
 
-    let Some((server_addr, options)) = parse_args()? else {
-        return Ok(());
-    };
+    let (server_addr, options) = client_options_from_args(args);
 
     info!("streamd-client connecting to {server_addr}");
 
@@ -34,47 +56,14 @@ fn main() -> Result<()> {
     runtime.block_on(transport::control::run_client(server_addr, options))
 }
 
-fn parse_args() -> Result<Option<(std::net::SocketAddr, transport::control::ClientOptions)>> {
-    let mut server_addr = None;
-    let mut options = transport::control::ClientOptions::default();
-    let mut args = std::env::args().skip(1);
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                print_usage();
-                return Ok(None);
-            }
-            "--list-displays" => {
-                options.list_displays = true;
-            }
-            "--display" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--display requires a value"))?;
-                options.display_selector = Some(value);
-            }
-            _ if arg.starts_with("--display=") => {
-                options.display_selector = Some(arg["--display=".len()..].to_string());
-            }
-            _ if arg.starts_with('-') => bail!("unknown flag: {arg}"),
-            _ if server_addr.is_none() => {
-                server_addr = Some(arg.parse()?);
-            }
-            _ => bail!("unexpected extra argument: {arg}"),
-        }
-    }
-
-    let server_addr = server_addr.unwrap_or_else(|| {
-        "127.0.0.1:9000"
-            .parse()
-            .expect("default server address is valid")
-    });
-    Ok(Some((server_addr, options)))
-}
-
-fn print_usage() {
-    println!("Usage: streamd-client [server_addr] [--display <id|index|name>] [--list-displays]");
+fn client_options_from_args(
+    args: Args,
+) -> (std::net::SocketAddr, transport::control::ClientOptions) {
+    let options = transport::control::ClientOptions {
+        list_displays: args.list_displays,
+        display_selector: args.display,
+    };
+    (args.server_addr, options)
 }
 
 fn install_rustls_crypto_provider() -> Result<()> {
@@ -122,4 +111,37 @@ fn run_macos_client(
     let shutdown_result = runtime.block_on(session.shutdown());
 
     render_result.and(shutdown_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_options_from_args, Args};
+    use clap::Parser;
+
+    #[test]
+    fn parses_default_values() {
+        let args = Args::try_parse_from(["streamd-client"]).expect("args should parse");
+        let (server_addr, options) = client_options_from_args(args);
+        assert_eq!(server_addr.to_string(), "127.0.0.1:9000");
+        assert!(options.display_selector.is_none());
+        assert!(!options.list_displays);
+    }
+
+    #[test]
+    fn parses_display_selection() {
+        let args = Args::try_parse_from([
+            "streamd-client",
+            "192.168.1.50:9000",
+            "--display",
+            "wayland:68",
+            "--list-displays",
+            "--log-filter",
+            "info,streamd_client=trace",
+        ])
+        .expect("args should parse");
+        let (server_addr, options) = client_options_from_args(args);
+        assert_eq!(server_addr.to_string(), "192.168.1.50:9000");
+        assert_eq!(options.display_selector.as_deref(), Some("wayland:68"));
+        assert!(options.list_displays);
+    }
 }

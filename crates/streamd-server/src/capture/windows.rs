@@ -675,7 +675,7 @@ fn build_remote_cursor_shape(cursor: &CursorState) -> Result<Option<RemoteCursor
             }
 
             let visible_height = cursor.height / 2;
-            let row_bytes = ((cursor.width + 31) / 32) * 4;
+            let row_bytes = cursor.width.div_ceil(32) * 4;
             let expected_len = usize::try_from(row_bytes)
                 .context("monochrome cursor row pitch overflow")?
                 .checked_mul(
@@ -851,7 +851,7 @@ fn enumerate_outputs() -> Result<Vec<SelectedOutput>> {
                     origin,
                     vendor_id: adapter_desc.VendorId,
                     info: DisplayInfo {
-                        id: windows_display_id(adapter_index as u32, output_index as u32),
+                        id: windows_display_id(adapter_index, output_index),
                         index: display_index,
                         name,
                         description,

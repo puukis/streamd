@@ -163,6 +163,7 @@ impl QuicVideoSender {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_slice(
         &self,
         frame_seq: u32,

@@ -212,6 +212,7 @@ fn apply_realtime_scheduling() {
 // Pipeline thread body
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn pipeline_thread(
     codec: Codec,
     fps: u8,
@@ -240,6 +241,7 @@ fn pipeline_thread(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pipeline_thread(
     codec: Codec,
     fps: u8,

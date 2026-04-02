@@ -38,7 +38,7 @@ pub struct InputCapture {
 impl InputCapture {
     /// Start capturing global input events and forwarding them to `event_tx`.
     ///
-    /// Capture starts idle. Press `Ctrl+Alt+Delete` locally to toggle
+    /// Capture starts idle. Press `Ctrl+Option+M` locally to toggle
     /// relative-mouse capture on/off.
     pub fn start(event_tx: Sender<InputPacket>) -> Result<Self> {
         let captured = Arc::new(AtomicBool::new(false));

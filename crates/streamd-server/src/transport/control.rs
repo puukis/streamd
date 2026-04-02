@@ -94,7 +94,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
 
     // Negotiate codec
     let codec = negotiate_codec(&req);
-    let fps = req.max_fps.min(120).max(1);
+    let fps = req.max_fps.clamp(1, 120);
     let displays = match crate::capture::list_displays().context("enumerate displays for session") {
         Ok(displays) => displays,
         Err(err) => {
@@ -124,12 +124,12 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
     let width = if selected_display.width > 0 {
         selected_display.width
     } else {
-        req.width.max(640).min(7680)
+        req.width.clamp(640, 7680)
     };
     let height = if selected_display.height > 0 {
         selected_display.height
     } else {
-        req.height.max(480).min(4320)
+        req.height.clamp(480, 4320)
     };
 
     let accept = SessionAccept {

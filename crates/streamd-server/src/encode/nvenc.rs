@@ -338,6 +338,7 @@ mod real {
         #[cfg(target_os = "windows")]
         type CuCtxDestroyFn = unsafe extern "system" fn(CudaContextRaw) -> CudaResult;
 
+        #[allow(dead_code)]
         pub struct ExternalMemory;
 
         #[cfg(target_os = "windows")]
@@ -402,7 +403,7 @@ mod real {
                         bail!("cuCtxCreate_v2 failed: {status}");
                     }
 
-                    return Ok(Self { raw, driver });
+                    Ok(Self { raw, driver })
                 }
 
                 #[cfg(not(target_os = "windows"))]
@@ -449,7 +450,7 @@ mod real {
     //   NVENCAPI_VERSION = MAJOR | (MINOR << 24)
     //   NVENCAPI_STRUCT_VERSION(ver) = NVENCAPI_VERSION | (ver << 16) | (0x7 << 28)
     // ---------------------------------------------------------------------------
-    const NVENCAPI_VERSION: u32 = 13u32 | (0u32 << 24);
+    const NVENCAPI_VERSION: u32 = 13u32;
     const fn sv(ver: u32) -> u32 {
         NVENCAPI_VERSION | (ver << 16) | (0x7 << 28)
     }

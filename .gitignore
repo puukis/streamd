@@ -1,5 +1,55 @@
-target/
-.claude/
-HANDOFF.md
-/nv-codec-headers/
+# Build outputs
+/target/
+**/*.rs.bk
+
+# Local agent / handoff state
+/.claude/
+/HANDOFF.md
+
+# Editor and IDE settings
+/.idea/
+/.vscode/
+/.vs/
+/.zed/
+/.fleet/
+/.cursor/
+*.code-workspace
+
+# Environment and local-only overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.envrc
+/.direnv/
+
+# Logs, temp files, and patch leftovers
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.pid
+*.trace
+*.swp
+*.swo
+
+# Coverage and profiling outputs
+/coverage/
+*.profraw
+*.profdata
+
+# Local release-planning scratch files
+/dist-manifest.json
+/plan-dist-manifest.json
+/artifacts/
+/tmp/
+/.cache/
+
+# OS-generated files
 .DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

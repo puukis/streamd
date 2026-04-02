@@ -1,0 +1,32 @@
+changelog:
+  exclude:
+    authors:
+      - "github-actions[bot]"
+    labels:
+      - "ignore-for-release"
+      - "skip-changelog"
+  categories:
+    - title: "Breaking Changes"
+      labels:
+        - "breaking-change"
+        - "Semver-Major"
+    - title: "Features"
+      labels:
+        - "enhancement"
+        - "feature"
+        - "Semver-Minor"
+    - title: "Fixes"
+      labels:
+        - "bug"
+        - "fix"
+        - "bugfix"
+    - title: "Documentation"
+      labels:
+        - "documentation"
+        - "docs"
+    - title: "Dependencies"
+      labels:
+        - "dependencies"
+    - title: "Other Changes"
+      labels:
+        - "*"

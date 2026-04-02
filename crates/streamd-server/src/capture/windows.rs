@@ -5,7 +5,7 @@ use crossbeam_channel::Sender as FrameSender;
 use std::{
     ffi::{c_void, CString},
     slice,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use streamd_proto::packets::{
     DisplayInfo, RemoteCursorShape, RemoteCursorShapeKind, RemoteCursorState,
@@ -13,32 +13,36 @@ use streamd_proto::packets::{
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 use windows::{
-    core::{Interface, PCSTR},
-    Win32::Graphics::{
-        Direct3D::{
-            Fxc::D3DCompile, ID3DBlob, ID3DInclude, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL,
-            D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_11_1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-        },
-        Direct3D11::{
-            D3D11CreateDevice, ID3D11Buffer, ID3D11DepthStencilView, ID3D11Device,
-            ID3D11DeviceContext, ID3D11InputLayout, ID3D11PixelShader, ID3D11RenderTargetView,
-            ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
-            D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-            D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
-            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
-        },
-        Dxgi::{
-            Common::{
-                DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM,
-                DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8_UINT,
-                DXGI_SAMPLE_DESC,
+    core::{Interface, HRESULT, PCSTR},
+    Win32::{
+        Foundation::E_ACCESSDENIED,
+        Graphics::{
+            Direct3D::{
+                Fxc::D3DCompile, ID3DBlob, ID3DInclude, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL,
+                D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
+                D3D_FEATURE_LEVEL_11_1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             },
-            CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput6,
-            IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND,
-            DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
-            DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
+            Direct3D11::{
+                D3D11CreateDevice, ID3D11Buffer, ID3D11DepthStencilView, ID3D11Device,
+                ID3D11DeviceContext, ID3D11InputLayout, ID3D11PixelShader, ID3D11RenderTargetView,
+                ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+                D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+                D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+                D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+                D3D11_USAGE_STAGING, D3D11_VIEWPORT,
+            },
+            Dxgi::{
+                Common::{
+                    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8_UINT,
+                    DXGI_SAMPLE_DESC,
+                },
+                CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput6,
+                IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+                DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
+                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
+            },
         },
     },
 };
@@ -46,6 +50,8 @@ use windows::{
 use crate::capture::{CaptureFrame, CaptureStats, CursorEvent, D3d11TextureHandle, ShmPixelFormat};
 
 const FRAME_TIMEOUT_MS: u32 = 500;
+const DUPLICATION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const DUPLICATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 
 // DXGI_OUTDUPL_POINTER_SHAPE_TYPE values
@@ -334,7 +340,7 @@ pub struct WindowsCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     output: IDXGIOutput1,
-    duplication: IDXGIOutputDuplication,
+    duplication: Option<IDXGIOutputDuplication>,
     staging_texture: Option<ID3D11Texture2D>,
     staging_resource: Option<ID3D11Resource>,
     gpu_renderer: Option<GpuFrameRenderer>,
@@ -347,6 +353,8 @@ pub struct WindowsCapture {
     display_origin: (i32, i32),
     cursor: CursorState,
     last_cursor_shape_sent_generation: u64,
+    duplication_retry_at: Option<Instant>,
+    duplication_retry_delay: Duration,
 }
 
 impl WindowsCapture {
@@ -358,8 +366,27 @@ impl WindowsCapture {
         let selected = select_output(display_id).context("find a desktop output for capture")?;
         let (device, context) =
             create_device(&selected.adapter).context("create D3D11 device for capture")?;
-        let duplication = duplicate_output(&selected.output, &device)
-            .context("create DXGI desktop duplication session")?;
+        let (duplication, duplication_retry_at) = match duplicate_output(&selected.output, &device)
+        {
+            Ok(duplication) => (Some(duplication), None),
+            Err(err) if is_temporary_duplication_error(&err) => {
+                warn!(
+                    "desktop duplication is temporarily unavailable on output {} during startup: {}; capture will retry in {} ms",
+                    selected.info.name,
+                    err,
+                    DUPLICATION_RETRY_INITIAL_DELAY.as_millis()
+                );
+                (
+                    None,
+                    Some(next_duplication_retry_deadline(
+                        DUPLICATION_RETRY_INITIAL_DELAY,
+                    )),
+                )
+            }
+            Err(err) => {
+                return Err(err).context("create DXGI desktop duplication session");
+            }
+        };
 
         let display_origin = selected.origin;
         let gpu_fp16_enabled = selected.vendor_id == NVIDIA_VENDOR_ID;
@@ -391,6 +418,8 @@ impl WindowsCapture {
             display_origin,
             cursor: CursorState::default(),
             last_cursor_shape_sent_generation: 0,
+            duplication_retry_at,
+            duplication_retry_delay: DUPLICATION_RETRY_INITIAL_DELAY,
         })
     }
 
@@ -410,17 +439,21 @@ impl WindowsCapture {
     }
 
     pub fn pump(&mut self) -> Result<()> {
+        self.maybe_recreate_duplication()?;
+
         loop {
+            let Some(duplication) = self.duplication.as_ref() else {
+                return Ok(());
+            };
             let acquire_started_at = Instant::now();
             let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = unsafe { std::mem::zeroed() };
             let mut resource: Option<IDXGIResource> = None;
             match unsafe {
-                self.duplication
-                    .AcquireNextFrame(FRAME_TIMEOUT_MS, &mut frame_info, &mut resource)
+                duplication.AcquireNextFrame(FRAME_TIMEOUT_MS, &mut frame_info, &mut resource)
             } {
                 Ok(()) => {
                     let acquire_wait_us = duration_to_us(acquire_started_at.elapsed());
-                    let _release = ReleaseFrameGuard::new(&self.duplication);
+                    let _release = ReleaseFrameGuard::new(duplication);
 
                     if frame_info.LastMouseUpdateTime != 0 {
                         self.cursor.visible = frame_info.PointerPosition.Visible.as_bool();
@@ -435,7 +468,7 @@ impl WindowsCapture {
                             unsafe { std::mem::zeroed() };
                         let mut actual_size = 0u32;
                         if unsafe {
-                            self.duplication.GetFramePointerShape(
+                            duplication.GetFramePointerShape(
                                 buf_size,
                                 shape_buf.as_mut_ptr() as *mut _,
                                 &mut actual_size,
@@ -568,12 +601,14 @@ impl WindowsCapture {
                 }
                 Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
                 Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
+                    let retry_delay = self.schedule_duplication_retry();
                     warn!(
-                        "desktop duplication access lost on output {}: {}; recreating session",
-                        self.output_name, err
+                        "desktop duplication access lost on output {}: {}; capture paused, retrying in {} ms",
+                        self.output_name,
+                        err,
+                        retry_delay.as_millis()
                     );
-                    self.recreate_duplication()
-                        .context("recreate DXGI desktop duplication session")?;
+                    return Ok(());
                 }
                 Err(err) => {
                     return Err(anyhow!(
@@ -583,6 +618,59 @@ impl WindowsCapture {
                 }
             }
         }
+    }
+
+    fn maybe_recreate_duplication(&mut self) -> Result<()> {
+        if self.duplication.is_some() {
+            return Ok(());
+        }
+
+        let Some(retry_at) = self.duplication_retry_at else {
+            return Ok(());
+        };
+        if Instant::now() < retry_at {
+            return Ok(());
+        }
+
+        match duplicate_output(&self.output, &self.device) {
+            Ok(duplication) => {
+                self.duplication = Some(duplication);
+                self.duplication_retry_at = None;
+                self.duplication_retry_delay = DUPLICATION_RETRY_INITIAL_DELAY;
+                info!(
+                    "desktop duplication recovered on output {}",
+                    self.output_name
+                );
+            }
+            Err(err) => {
+                let retry_delay = self.schedule_duplication_retry();
+                warn!(
+                    "desktop duplication is still unavailable on output {}: {}; retrying in {} ms",
+                    self.output_name,
+                    err,
+                    retry_delay.as_millis()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn schedule_duplication_retry(&mut self) -> Duration {
+        self.duplication = None;
+        self.staging_texture = None;
+        self.staging_resource = None;
+        self.gpu_renderer = None;
+
+        let retry_delay = self.duplication_retry_delay;
+        self.duplication_retry_at = Some(next_duplication_retry_deadline(retry_delay));
+        self.duplication_retry_delay = self
+            .duplication_retry_delay
+            .checked_mul(2)
+            .unwrap_or(DUPLICATION_RETRY_MAX_DELAY)
+            .min(DUPLICATION_RETRY_MAX_DELAY);
+
+        retry_delay
     }
 
     fn ensure_gpu_renderer(&mut self, width: u32, height: u32) -> Result<&mut GpuFrameRenderer> {
@@ -603,15 +691,6 @@ impl WindowsCapture {
         self.gpu_renderer
             .as_mut()
             .context("desktop GPU renderer missing after allocation")
-    }
-
-    fn recreate_duplication(&mut self) -> Result<()> {
-        self.duplication = duplicate_output(&self.output, &self.device)
-            .context("duplicate output after access loss")?;
-        self.staging_texture = None;
-        self.staging_resource = None;
-        self.gpu_renderer = None;
-        Ok(())
     }
 
     fn publish_cursor_shape_if_needed(&mut self) -> Result<()> {
@@ -942,6 +1021,25 @@ fn duplicate_output(
         desc.ModeDesc.Width, desc.ModeDesc.Height
     );
     Ok(duplication)
+}
+
+fn is_temporary_duplication_error(err: &anyhow::Error) -> bool {
+    error_chain_contains_hresult(err, DXGI_ERROR_ACCESS_LOST)
+        || error_chain_contains_hresult(err, E_ACCESSDENIED)
+}
+
+fn error_chain_contains_hresult(err: &anyhow::Error, code: HRESULT) -> bool {
+    err.chain()
+        .any(|cause| match cause.downcast_ref::<windows::core::Error>() {
+            Some(windows_err) => windows_err.code() == code,
+            None => false,
+        })
+}
+
+fn next_duplication_retry_deadline(delay: Duration) -> Instant {
+    Instant::now()
+        .checked_add(delay)
+        .unwrap_or_else(Instant::now)
 }
 
 fn get_texture_desc(texture: &ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {

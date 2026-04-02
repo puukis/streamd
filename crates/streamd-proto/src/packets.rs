@@ -316,7 +316,7 @@ pub struct RemoteCursorState {
 }
 
 /// Protocol version. Both sides must agree or the server rejects the session.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Parse a `VideoPacketHeader` from the first 24 bytes of a datagram payload.
 /// Returns `(header, remaining_payload)` on success.

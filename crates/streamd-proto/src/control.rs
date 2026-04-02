@@ -5,15 +5,16 @@
 //! payload.
 //!
 //! QUIC unreliable datagrams carry a 1-byte type tag as the very first byte so
-//! a single `conn.read_datagram()` call can dispatch between video fragments and
-//! cursor state updates:
+//! a single `conn.read_datagram()` call can dispatch between video fragments,
+//! cursor state updates, and mouse-move input events:
 //!
-//! | Tag | Content |
-//! |-----|---------|
-//! | `DATAGRAM_TAG_CURSOR` (0x01) | bincode-encoded `RemoteCursorState` |
-//! | `DATAGRAM_TAG_VIDEO`  (0x02) | 24-byte `VideoPacketHeader` + encoded video or FEC parity data |
+//! | Tag | Direction | Content |
+//! |-----|-----------|---------|
+//! | `DATAGRAM_TAG_CURSOR` (0x01) | server→client | bincode-encoded `RemoteCursorState` |
+//! | `DATAGRAM_TAG_VIDEO`  (0x02) | server→client | 24-byte `VideoPacketHeader` + encoded video or FEC parity data |
+//! | `DATAGRAM_TAG_INPUT`  (0x03) | client→server | bincode-encoded `InputPacket` carrying `InputEvent::MouseMove` |
 
-use crate::packets::RemoteCursorState;
+use crate::packets::{InputPacket, RemoteCursorState};
 use bincode::{
     config::standard,
     serde::{decode_from_slice, encode_to_vec},
@@ -27,6 +28,13 @@ pub const DATAGRAM_TAG_CURSOR: u8 = 0x01;
 
 /// Datagram type tag for video fragment packets.
 pub const DATAGRAM_TAG_VIDEO: u8 = 0x02;
+
+/// Datagram type tag for unreliable mouse-move input packets (client→server).
+///
+/// Only `InputEvent::MouseMove` is routed this way. All other input events
+/// (key presses, mouse buttons, scroll) remain on the reliable input stream
+/// so that ordering and delivery guarantees are preserved.
+pub const DATAGRAM_TAG_INPUT: u8 = 0x03;
 
 /// Encode a `ControlMsg` into length-prefixed bytes ready to write to a QUIC stream.
 pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
@@ -82,6 +90,31 @@ pub fn encode_video_datagram(packet: &[u8]) -> Bytes {
     bytes.push(DATAGRAM_TAG_VIDEO);
     bytes.extend_from_slice(packet);
     Bytes::from(bytes)
+}
+
+/// Encode an `InputPacket` as an unreliable QUIC datagram (client→server).
+///
+/// Wire format: `[DATAGRAM_TAG_INPUT (1 byte)] [bincode(InputPacket)]`
+///
+/// Only `InputEvent::MouseMove` events should be sent this way; all other
+/// input events travel on the reliable input stream.
+pub fn encode_input_datagram(packet: &InputPacket) -> Bytes {
+    let payload = encode_to_vec(packet, standard()).expect("bincode encode input datagram");
+    let mut bytes = Vec::with_capacity(1 + payload.len());
+    bytes.push(DATAGRAM_TAG_INPUT);
+    bytes.extend_from_slice(&payload);
+    Bytes::from(bytes)
+}
+
+/// Decode an input datagram received over QUIC.
+///
+/// Returns `None` if the tag byte is missing or wrong, or bincode decoding fails.
+pub fn decode_input_datagram(buf: &[u8]) -> Option<InputPacket> {
+    if buf.first() != Some(&DATAGRAM_TAG_INPUT) {
+        return None;
+    }
+    let (packet, _) = decode_from_slice::<InputPacket, _>(&buf[1..], standard()).ok()?;
+    Some(packet)
 }
 
 #[cfg(test)]

@@ -454,7 +454,13 @@ async fn connect_active_connection(
     let input_shutdown = connection_shutdown.clone();
     let input_conn = conn.clone();
     let input_task = tokio::task::spawn_blocking(move || {
-        forward_input_loop(input_rx, input_stream, input_conn, input_runtime, input_shutdown)
+        forward_input_loop(
+            input_rx,
+            input_stream,
+            input_conn,
+            input_runtime,
+            input_shutdown,
+        )
     });
 
     let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(8);

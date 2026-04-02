@@ -12,7 +12,9 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use streamd_proto::{
-    control::{decode_input_datagram, decode_msg, encode_cursor_datagram, encode_msg, DATAGRAM_TAG_INPUT},
+    control::{
+        decode_input_datagram, decode_msg, encode_cursor_datagram, encode_msg, DATAGRAM_TAG_INPUT,
+    },
     input::decode_packet,
     packets::{
         Codec, ControlMsg, DisplayInfo, InputPacket, SessionAccept, SessionReject, SessionRequest,

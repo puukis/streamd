@@ -62,7 +62,7 @@ git tag v0.1.0-alpha.1
 git push origin v0.1.0-alpha.1
 ```
 
-Every `v*` tag runs the generated release workflow and publishes platform-specific artifacts for the host and client binaries.
+Every `v*` tag runs the release workflow and publishes platform-specific artifacts for the host and client binaries. The GitHub release title and body are taken from the matching file in `docs/releases/`.
 
 ## Build From Source
 
@@ -228,7 +228,7 @@ The repo now has a real release lane:
 * SHA-256 checksums for archives
 * CycloneDX SBOM generation
 * GitHub artifact attestations
-* auto-generated GitHub release notes grouped by labels
+* curated repo-owned GitHub release notes published from `docs/releases/<tag>.md`
 * Dependabot updates for Rust dependencies and GitHub Actions
 
 If you change packaging config, run:
@@ -236,6 +236,12 @@ If you change packaging config, run:
 ```bash
 dist generate
 dist plan
+```
+
+To scaffold the next release note body before tagging:
+
+```bash
+python scripts/generate_release_notes.py v0.1.0-alpha.2 --previous-tag v0.1.0-alpha.1 --output docs/releases/v0.1.0-alpha.2.md
 ```
 
 ## Security Model

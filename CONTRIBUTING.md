@@ -29,7 +29,7 @@ Both are enforced by CI. Format before opening a PR.
 
 ## Release-aware changes
 
-Releases are cut from git tags and built by `cargo-dist`.
+Releases are cut from git tags and built by `cargo-dist`, but the GitHub release body is now a curated markdown file checked in under `docs/releases/`.
 
 If you touch packaging, binary metadata, or release automation, also run:
 
@@ -40,6 +40,14 @@ dist plan
 
 `cargo-dist` 0.31.0 currently needs a small manual fix in `.github/workflows/release.yml` for the SBOM upload step, so always inspect that diff before committing regenerated release CI.
 
+Before tagging a new release:
+
+```bash
+python scripts/generate_release_notes.py v0.1.0-alpha.2 --previous-tag v0.1.0-alpha.1 --output docs/releases/v0.1.0-alpha.2.md
+```
+
+Then edit the generated markdown by hand, commit it, and only tag once the notes read like the release body you actually want published. The workflow uses that file directly.
+
 If your change should be called out in release notes, apply one of the standard labels:
 
 * `enhancement`
@@ -47,6 +55,8 @@ If your change should be called out in release notes, apply one of the standard 
 * `documentation`
 * `dependencies`
 * `breaking-change`
+
+`CHANGELOG.md` stays high level. Detailed technical release narratives live in `docs/releases/`.
 
 ## Changing the protocol
 

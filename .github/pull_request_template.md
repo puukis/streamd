@@ -23,7 +23,7 @@ Explain the problem this PR fixes or the reason for the change.
 
 ## Release Notes Label
 
-Choose the label that best fits this PR so generated release notes stay useful:
+Choose the label that best fits this PR so curated release note scaffolds group changes correctly:
 
 - [ ] `enhancement`
 - [ ] `bug`

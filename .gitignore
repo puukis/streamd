@@ -5,7 +5,9 @@
 # Local agent / handoff state
 /.claude/
 /.omx/
+/CLAUDE.md
 /HANDOFF.md
+/IMPROVEMENT_REPORT.md
 /AGENTS.md
 
 # Editor and IDE settings

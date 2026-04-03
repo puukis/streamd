@@ -782,10 +782,11 @@ fn cursor_position_relative_to_display(
     cursor: &CursorState,
     display_origin: (i32, i32),
 ) -> (i32, i32) {
-    (
-        cursor.x - display_origin.0 - cursor.hot_x,
-        cursor.y - display_origin.1 - cursor.hot_y,
-    )
+    // DXGI_OUTDUPL_POINTER_POSITION.Position is already the top-left corner of
+    // the cursor bitmap in desktop coordinates — not the hotspot/tip position.
+    // Subtracting hot_x/hot_y here would double-offset the bitmap upper-left
+    // and render it a few pixels in the wrong direction.
+    (cursor.x - display_origin.0, cursor.y - display_origin.1)
 }
 
 fn ensure_staging_texture(

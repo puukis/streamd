@@ -1,7 +1,7 @@
 # streamd
 
 ![CI](https://github.com/puukis/streamd/actions/workflows/ci.yml/badge.svg)
-![Release](https://img.shields.io/github/v/release/puukis/streamd?display_name=tag)
+![Release](https://img.shields.io/github/v/release/puukis/streamd?include_prereleases)
 ![License](https://img.shields.io/github/license/puukis/streamd)
 ![Host](https://img.shields.io/badge/host-Linux%20%7C%20Windows-0f766e)
 ![Client](https://img.shields.io/badge/client-macOS-4338ca)

@@ -740,6 +740,25 @@ mod real {
             Self::with_cuda_context(config, device_ctx)
         }
 
+        /// Mark a previously encoded frame as a lost reference so NVENC routes
+        /// subsequent P-frames around it.  `frame_timestamp_us` must match the
+        /// `inputTimeStamp` value that was supplied to `NvEncEncodePicture` for
+        /// the lost frame.
+        ///
+        /// After this call the next encoded P-frame will reference only frames
+        /// whose timestamps have not been invalidated, producing one visually
+        /// imperfect frame followed by a clean stream — without requiring an IDR.
+        pub fn invalidate_ref_frame(&mut self, frame_timestamp_us: u64) -> Result<()> {
+            let Some(invalidate_fn) = self.api.nvEncInvalidateRefFrames else {
+                bail!("nvEncInvalidateRefFrames is not available in the loaded NVENC library");
+            };
+            let status = unsafe { invalidate_fn(self.encoder, frame_timestamp_us) };
+            if status != NV_ENC_SUCCESS {
+                bail!("nvEncInvalidateRefFrames failed: {status:?}");
+            }
+            Ok(())
+        }
+
         pub fn reconfigure(&mut self, config: NvencConfig) -> Result<()> {
             if config.width != self.config.width || config.height != self.config.height {
                 bail!(
@@ -1743,6 +1762,10 @@ impl NvencEncoder {
     }
 
     pub fn reconfigure(&mut self, _config: NvencConfig) -> Result<()> {
+        anyhow::bail!("NVENC not available")
+    }
+
+    pub fn invalidate_ref_frame(&mut self, _frame_timestamp_us: u64) -> Result<()> {
         anyhow::bail!("NVENC not available")
     }
 

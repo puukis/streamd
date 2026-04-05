@@ -309,6 +309,9 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
                         info!("IDR requested by client");
                         pipeline.request_idr();
                     }
+                    Ok(ControlMsg::FrameLost(frame_seq)) => {
+                        pipeline.notify_frame_lost(frame_seq);
+                    }
                     Ok(ControlMsg::ClientTelemetry(sample)) => {
                         pipeline.update_client_telemetry(sample);
                     }

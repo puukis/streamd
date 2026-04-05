@@ -231,6 +231,12 @@ pub enum ControlMsg {
     CursorState(RemoteCursorState),
     /// Graceful shutdown.
     Goodbye,
+    /// Client reports that `frame_seq` was unrecoverably lost.
+    ///
+    /// The server responds by calling `NvEncInvalidateRefFrames` for the
+    /// matching encoded frame so subsequent P-frames reference only clean
+    /// frames, avoiding a full IDR cycle.
+    FrameLost(u32),
 }
 
 /// Per-window telemetry stamped by the client.
@@ -316,7 +322,7 @@ pub struct RemoteCursorState {
 }
 
 /// Protocol version. Both sides must agree or the server rejects the session.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Parse a `VideoPacketHeader` from the first 24 bytes of a datagram payload.
 /// Returns `(header, remaining_payload)` on success.

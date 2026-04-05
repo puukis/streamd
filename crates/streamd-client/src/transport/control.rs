@@ -42,7 +42,14 @@ use crate::{
     transport::video_rx::{DecodedFrame, ReassemblyLoss, VideoFrameReassembler},
 };
 
-const IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// Minimum interval between IDR fallback requests.
+///
+/// `FrameLost` is sent immediately on every loss event to trigger fast ref
+/// invalidation.  A `RequestIdr` is also sent if this interval has elapsed
+/// since the last one — providing a safety net for sustained loss where
+/// `invalidateRefFrames` cannot help because the entire reference chain is
+/// corrupt.
+const IDR_FALLBACK_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const CLIENT_TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 const QUIC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -64,6 +71,8 @@ pub struct ClientOptions {
     pub min_fps: u8,
     pub min_bitrate_bps: u32,
     pub max_bitrate_bps: u32,
+    /// Enable optical-flow frame interpolation on the client render loop.
+    pub interpolate: bool,
 }
 
 pub struct ClientSession {
@@ -204,6 +213,7 @@ async fn join_task(name: &str, task: Option<tokio::task::JoinHandle<Result<()>>>
 }
 
 pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Result<()> {
+    let interpolate = options.interpolate;
     let Some(mut session) = connect_client_session(server_addr, options).await? else {
         return Ok(());
     };
@@ -215,6 +225,7 @@ pub async fn run_client(server_addr: SocketAddr, options: ClientOptions) -> Resu
         session.cursor_store(),
         session.shutdown_signal(),
         session.telemetry(),
+        interpolate,
     );
     let shutdown_result = session.shutdown().await;
     render_result.and(shutdown_result)
@@ -557,7 +568,7 @@ async fn datagram_dispatch_loop(
     telemetry: SharedClientTelemetry,
 ) -> Result<()> {
     let mut reassembler = VideoFrameReassembler::new();
-    let mut last_idr_request_at = None;
+    let mut last_idr_fallback_at: Option<Instant> = None;
 
     loop {
         let bytes = match conn.read_datagram().await {
@@ -577,7 +588,7 @@ async fn datagram_dispatch_loop(
                         0,
                         false,
                     );
-                    maybe_request_idr(&control_tx, &mut last_idr_request_at, loss);
+                    report_frame_loss(&control_tx, loss, &mut last_idr_fallback_at);
                 }
                 if outcome.recovered_fragments > 0 || outcome.recovered_frame {
                     telemetry.record_reassembly(
@@ -642,28 +653,48 @@ async fn control_send_loop(
     Ok(())
 }
 
-fn maybe_request_idr(
+/// Report unrecoverable frame loss to the server.
+///
+/// **Fast path:** `FrameLost(frame_seq)` is sent immediately for every loss
+/// event so the server can call `NvEncInvalidateRefFrames`.  For isolated
+/// losses (one or two frames) this allows recovery in a single frame without
+/// an IDR.
+///
+/// **Fallback path:** If `IDR_FALLBACK_MIN_INTERVAL` has elapsed since the
+/// last `RequestIdr`, one is sent as well.  This catches sustained loss where
+/// the entire P-frame reference chain is corrupt and `invalidateRefFrames`
+/// alone cannot help — the decoder needs a clean I-frame to resync.
+fn report_frame_loss(
     control_tx: &UnboundedSender<ControlMsg>,
-    last_idr_request_at: &mut Option<Instant>,
     loss: ReassemblyLoss,
+    last_idr_fallback_at: &mut Option<Instant>,
 ) {
-    let now = Instant::now();
-    if last_idr_request_at
-        .as_ref()
-        .is_some_and(|last| now.duration_since(*last) < IDR_REQUEST_MIN_INTERVAL)
-    {
-        return;
-    }
-
-    match control_tx.send(ControlMsg::RequestIdr) {
+    match control_tx.send(ControlMsg::FrameLost(loss.frame_seq)) {
         Ok(()) => {
-            *last_idr_request_at = Some(now);
             info!(
-                "requested IDR after dropping {} unrecoverable frame(s), oldest seq={}",
-                loss.dropped_frames, loss.frame_seq
+                "sent FrameLost(seq={}) after dropping {} unrecoverable frame(s)",
+                loss.frame_seq, loss.dropped_frames
             );
         }
-        Err(err) => warn!("failed to request IDR after frame loss: {err}"),
+        Err(err) => warn!("failed to send FrameLost after frame loss: {err}"),
+    }
+
+    let now = Instant::now();
+    let idr_due = last_idr_fallback_at
+        .as_ref()
+        .is_none_or(|last| now.duration_since(*last) >= IDR_FALLBACK_MIN_INTERVAL);
+
+    if idr_due {
+        match control_tx.send(ControlMsg::RequestIdr) {
+            Ok(()) => {
+                *last_idr_fallback_at = Some(now);
+                info!(
+                    "requested IDR fallback after frame loss (seq={}, dropped={})",
+                    loss.frame_seq, loss.dropped_frames
+                );
+            }
+            Err(err) => warn!("failed to send IDR fallback after frame loss: {err}"),
+        }
     }
 }
 

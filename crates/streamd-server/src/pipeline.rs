@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -342,6 +343,7 @@ pub struct PipelineHandle {
     client_telemetry_tx: Sender<ClientTelemetry>,
     telemetry_rx: Option<UnboundedReceiver<ServerTelemetry>>,
     cursor_rx: Option<UnboundedReceiver<CursorEvent>>,
+    frame_lost_tx: Sender<u32>,
 }
 
 impl PipelineHandle {
@@ -365,6 +367,7 @@ impl PipelineHandle {
         let (client_telemetry_tx, client_telemetry_rx) = unbounded::<ClientTelemetry>();
         let (telemetry_tx, telemetry_rx) = unbounded_channel::<ServerTelemetry>();
         let (cursor_tx, cursor_rx) = unbounded_channel::<CursorEvent>();
+        let (frame_lost_tx, frame_lost_rx) = unbounded::<u32>();
         let runtime = tokio::runtime::Handle::current();
 
         let idr_flag = idr_requested.clone();
@@ -387,6 +390,7 @@ impl PipelineHandle {
                     conn,
                     runtime,
                     client_telemetry_rx,
+                    frame_lost_rx,
                     idr_flag,
                     stop,
                     telemetry_tx,
@@ -400,11 +404,21 @@ impl PipelineHandle {
             client_telemetry_tx,
             telemetry_rx: Some(telemetry_rx),
             cursor_rx: Some(cursor_rx),
+            frame_lost_tx,
         })
     }
 
     pub fn request_idr(&self) {
         self.idr_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// Notify the pipeline that `frame_seq` was lost in transit.
+    ///
+    /// The pipeline thread will call `NvEncInvalidateRefFrames` for the
+    /// matching frame so subsequent P-frames skip the corrupt reference,
+    /// allowing the stream to recover without a full IDR cycle.
+    pub fn notify_frame_lost(&self, frame_seq: u32) {
+        let _ = self.frame_lost_tx.send(frame_seq);
     }
 
     pub fn stop(&self) {
@@ -570,6 +584,7 @@ fn pipeline_thread(
     conn: quinn::Connection,
     runtime: tokio::runtime::Handle,
     client_telemetry_rx: Receiver<ClientTelemetry>,
+    frame_lost_rx: Receiver<u32>,
     idr_requested: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     telemetry_tx: UnboundedSender<ServerTelemetry>,
@@ -586,6 +601,7 @@ fn pipeline_thread(
         conn,
         runtime,
         client_telemetry_rx,
+        frame_lost_rx,
         idr_requested,
         stop_flag,
         telemetry_tx,
@@ -610,6 +626,7 @@ fn run_pipeline_thread(
     conn: quinn::Connection,
     runtime: tokio::runtime::Handle,
     client_telemetry_rx: Receiver<ClientTelemetry>,
+    frame_lost_rx: Receiver<u32>,
     idr_requested: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     telemetry_tx: UnboundedSender<ServerTelemetry>,
@@ -656,9 +673,13 @@ fn run_pipeline_thread(
         let mut registered_dmabufs = HashSet::new();
         let mut pending_frame = Some(first_frame);
         let mut force_idr_after_capture_reset = false;
+        // Ring of (frame_seq, timestamp_us) for the most recent frames.
+        // Used to look up the timestamp when the client reports a FrameLost.
+        let mut ref_frame_timestamps: VecDeque<(u32, u64)> = VecDeque::new();
 
         while !stop_flag.load(Ordering::Relaxed) {
             drain_latest_client_telemetry(&client_telemetry_rx, &mut latest_client_telemetry);
+            invalidate_lost_ref_frames(&frame_lost_rx, &mut ref_frame_timestamps, &mut encoder);
 
             let frame_started_at = Instant::now();
             let frame = match pending_frame.take() {
@@ -793,6 +814,7 @@ fn run_pipeline_thread(
                 encoded.is_keyframe,
                 frame_send_stats,
             );
+            record_ref_frame_timestamp(&mut ref_frame_timestamps, frame_seq, encoded.timestamp_us);
             frame_seq = frame_seq.wrapping_add(1);
 
             drain_latest_client_telemetry(&client_telemetry_rx, &mut latest_client_telemetry);
@@ -833,6 +855,9 @@ fn run_pipeline_thread(
         let mut controller = AdaptiveStreamController::new(&base_config, adaptive_config);
         let mut frame_interval = controller.frame_interval();
         let mut next_frame_deadline = initialise_frame_deadline(frame_interval);
+        // Ring of (frame_seq, timestamp_us) for the most recent frames.
+        // Used to look up the timestamp when the client reports a FrameLost.
+        let mut ref_frame_timestamps: VecDeque<(u32, u64)> = VecDeque::new();
         let mut encoder = match build_windows_encoder(
             &capture,
             matches!(
@@ -870,6 +895,7 @@ fn run_pipeline_thread(
 
         while !stop_flag.load(Ordering::Relaxed) {
             drain_latest_client_telemetry(&client_telemetry_rx, &mut latest_client_telemetry);
+            invalidate_lost_ref_frames(&frame_lost_rx, &mut ref_frame_timestamps, &mut encoder);
 
             let frame_started_at = Instant::now();
             let frame = match pending_frame.take() {
@@ -990,6 +1016,7 @@ fn run_pipeline_thread(
                 encoded.is_keyframe,
                 frame_send_stats,
             );
+            record_ref_frame_timestamp(&mut ref_frame_timestamps, frame_seq, encoded.timestamp_us);
             frame_seq = frame_seq.wrapping_add(1);
 
             drain_latest_client_telemetry(&client_telemetry_rx, &mut latest_client_telemetry);
@@ -1022,6 +1049,7 @@ fn run_pipeline_thread(
             adaptive_config,
             conn,
             client_telemetry_rx,
+            frame_lost_rx,
             idr_requested,
             stop_flag,
             telemetry_tx,
@@ -1032,6 +1060,56 @@ fn run_pipeline_thread(
 
     info!("pipeline thread stopped");
     Ok(())
+}
+
+/// Maximum number of frame timestamps retained for ref-frame invalidation
+/// lookups.  At 120 fps and a ~500 ms worst-case RTT this covers ~60 frames;
+/// 128 gives comfortable headroom without material memory cost.
+const REF_FRAME_RING_SIZE: usize = 128;
+
+/// Append a (frame_seq, timestamp_us) entry to the ring, evicting the oldest
+/// entry when the ring is full.
+fn record_ref_frame_timestamp(
+    ring: &mut VecDeque<(u32, u64)>,
+    frame_seq: u32,
+    timestamp_us: u64,
+) {
+    if ring.len() >= REF_FRAME_RING_SIZE {
+        ring.pop_front();
+    }
+    ring.push_back((frame_seq, timestamp_us));
+}
+
+/// Drain all pending `FrameLost` notifications and call
+/// `NvEncInvalidateRefFrames` for each one that still has a known timestamp.
+///
+/// Errors from `invalidate_ref_frame` are logged as warnings rather than
+/// bubbled up; a failed invalidation is non-fatal — the stream falls back to
+/// the existing IDR-based recovery path if the decoder cannot cope.
+fn invalidate_lost_ref_frames(
+    frame_lost_rx: &Receiver<u32>,
+    ring: &mut VecDeque<(u32, u64)>,
+    encoder: &mut NvencEncoder,
+) {
+    while let Ok(frame_seq) = frame_lost_rx.try_recv() {
+        if let Some(&(_, timestamp_us)) = ring.iter().find(|&&(seq, _)| seq == frame_seq) {
+            if let Err(err) = encoder.invalidate_ref_frame(timestamp_us) {
+                warn!(
+                    "ref frame invalidation failed for frame_seq={frame_seq} ts={timestamp_us}: {err:#}"
+                );
+            } else {
+                info!("invalidated ref frame seq={frame_seq} ts={timestamp_us}");
+            }
+        } else {
+            // Timestamp no longer in the ring (very old loss report) — fall
+            // back to IDR.  The client should have already sent RequestIdr
+            // as a fallback when FrameLost doesn't produce a clean stream
+            // quickly enough.
+            warn!(
+                "FrameLost for seq={frame_seq} has no timestamp in ring; cannot invalidate ref frame"
+            );
+        }
+    }
 }
 
 fn encoder_config(codec: Codec, width: u32, height: u32, fps: u8) -> NvencConfig {
